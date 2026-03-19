@@ -1,6 +1,6 @@
 # Wukong (悟空) — DAG-based Code Vulnerability Scanner
 
-Wukong 是一个基于 DAG（有向无环图）调度的代码安全审计工具，结合 LLM Agent 的语义理解能力与传统静态分析工具 Pecker 的污点追踪能力，实现对 Java/Go/Python 项目的自动化漏洞扫描。
+Wukong 是一个基于 DAG（有向无环图）调度的代码安全审计工具，结合 LLM Agent 的语义理解能力，通过原生污点分析（taint analysis）与多维度安全审计，实现对 Java/Go/Python 项目的自动化漏洞扫描。
 
 ## 整体架构
 
@@ -19,14 +19,14 @@ Wukong 是一个基于 DAG（有向无环图）调度的代码安全审计工具
                     │  DAGScheduler  │  ←── Kahn 拓扑排序 + asyncio 并行执行
                     └───────┬───────┘
                             │
-        ┌───────────────────┼───────────────────────────┐
-        ▼                   ▼                           ▼
-   LLM Agent          Pecker (subprocess)         Template Renderer
-  (AuditAgent)        (pecker_scanner)           (report_generator)
-        │
-   ┌────┴────┐
-   │ToolRegistry │  ←── read_file / glob_files / grep_content / write_file
-   └─────────┘
+         ┌──────────────────┼────────────────────┐
+         ▼                  ▼                    ▼
+    LLM Agent         LLM Agent            Template Renderer
+   (AuditAgent)     (taint_analyzer)       (report_generator)
+         │
+    ┌────┴─────┐
+    │ToolRegistry │  ←── read_file / glob_files / grep_content / write_file
+    └──────────┘
 ```
 
 ### DAG 执行流程
@@ -36,7 +36,7 @@ Layer 0:  route_mapper                         (提取 HTTP 路由)
               │
               ├─────────────┬──────────────┬─────────────────────┐
               ▼             ▼              ▼                     ▼
-Layer 1:  auth_auditor  pecker_scanner  hardcoded_auditor  path_traversal_auditor
+Layer 1:  auth_auditor  taint_analyzer  hardcoded_auditor  path_traversal_auditor
           (认证审计)    (污点分析)       (硬编码检测)        (路径穿越检测)
               │             │              │                     │
               └─────────────┼──────────────┼─────────────────────┘
@@ -79,7 +79,7 @@ wukong/
 │       ├── auth_auditor.py       # Layer 1: 认证/授权漏洞审计
 │       ├── hardcoded_auditor.py  # Layer 1: 硬编码密钥/凭据检测
 │       ├── path_traversal_auditor.py  # Layer 1: 路径穿越漏洞检测
-│       ├── pecker_scanner.py     # Layer 1: Pecker 污点分析 (subprocess)
+│       ├── taint_analyzer.py     # Layer 1: LLM 驱动的污点分析 (SQLI/RCE/XXE/SSRF)
 │       ├── vuln_verifier.py      # Layer 2: 独立源码验证
 │       └── report_generator.py   # Layer 3: Markdown/JSON 报告生成
 ```
@@ -97,7 +97,6 @@ wukong/
 | `model` | 模型名称 | `claude-sonnet-4-20250514` / `gpt-4o` |
 | `api_key` | API 密钥 | 从环境变量读取 |
 | `base_url` | API 端点 | 从环境变量读取 |
-| `pecker_path` | Pecker 工具路径 | 空 (不启用) |
 | `output_dir` | 输出目录 | `/tmp/{project}-audit` |
 | `max_concurrent_agents` | 同层最大并发数 | 3 |
 | `agent_max_turns` | 每个 Agent 最大对话轮次 | 0 (不限) |
@@ -155,7 +154,7 @@ async def run_path_traversal_auditor(config: AuditConfig, inputs: dict) -> dict:
 | `grep_content(pattern, path, file_type)` | 正则搜索文件内容，最多 500 条 |
 | `write_file(path, content)` | 写入文件 |
 | `append_file(path, content)` | 追加文件 |
-| `run_command(command)` | 执行 shell 命令 (仅 scanner agent) |
+| `run_command(command)` | 执行 shell 命令 |
 
 ### 5. DAGScheduler
 
@@ -166,15 +165,6 @@ async def run_path_traversal_auditor(config: AuditConfig, inputs: dict) -> dict:
 3. 每个 Stage 执行时收集上游依赖的输出作为输入
 4. 上游失败则下游自动跳过
 5. 支持 per-stage 超时（`asyncio.wait_for`）
-
-### 6. Pecker 集成
-
-Pecker 作为外部子进程调用（非 Python import），支持两种入口：
-
-- **entry.py 模式**: `python3 entry.py --input input.json --output output.json`
-- **main.py 模式**: 通过完整 CLI 参数调用
-
-Pecker 输出的 `re_judge_result == "False"` 的结果（Pecker 自判误报）会被自动过滤。
 
 ## Agent 详细说明
 
@@ -214,20 +204,51 @@ Pecker 输出的 `re_judge_result == "False"` 的结果（Pecker 自判误报）
 - 检查框架版本的已知 CVE（如 CVE-2018-9159）
 - 输出: `{"findings": [Finding...]}`
 
-### pecker_scanner (Layer 1)
+### taint_analyzer (Layer 1)
 
-调用 Pecker 静态分析工具进行污点追踪。
+LLM 驱动的原生污点分析，覆盖 SQLI / RCE / XXE / SSRF 四类漏洞。
 
-- 通过子进程调用 Pecker
-- 转换 Pecker 的 VulnDetail 为统一的 Finding 格式
-- 过滤 Pecker 自判的误报
+此 Agent 取代了之前基于子进程调用的 Pecker 扫描器，将污点分析逻辑以原生 LLM Agent 形式重新实现。核心方法论来自 Pecker 的 **正向追踪（Source→Sink）生产者/消费者** 架构，由 LLM 驱动代码理解和追踪：
+
+**分析流程（5 阶段）：**
+
+1. **Phase 1 — 构建初始工作队列**
+   - 根据 route_mapper 提供的路由列表，读取每个 handler 的源码，作为初始工作队列
+   - 通过 `grep_content` 在代码库中广泛搜索 4 类危险 Sink 模式，帮助优先排序
+   - 内嵌 54+ SQL 注入 Sink、6+ RCE Sink、51+ XXE Sink、SSRF Sink 的匹配规则
+
+2. **Phase 2 — 正向追踪（Sink Check + Next-Call 展开）**
+   - 对每个方法执行两个任务：
+     - **Task A — Sink Check**（等价于 Pecker 的 `first_sink_chat()`）：检查当前方法是否包含危险 Sink 调用
+     - **Task B — Next-Call 展开**（等价于 Pecker 的 `second_vulnerability_chat()`）：识别值得深入追踪的子函数调用
+   - 递归追踪子函数，最多 6 层深度
+   - 重复检测：同一调用链中已分析的方法不会重复分析
+   - **关键**：无论是否找到 Sink，都要执行 Next-Call 展开
+
+3. **Phase 3 — Multi-Judge 多维验证**
+   - 对每个潜在漏洞执行多维度判定（借鉴 Pecker 的 multi-judge chain，早期终止）：
+     - **SQLI**: sink_check → input_check → sanitizer_check → taint_check
+     - **RCE**: sink_check → input_check → sanitizer_check → taint_check
+     - **XXE**: sink_check → feature_check → input_check → taint_check
+     - **SSRF**: sink_check → input_check → sanitizer_check → taint_check
+   - 任意一个 check 返回 True（安全），则判定为误报并丢弃
+
+4. **Phase 4 — XML/MyBatis 逆向污点验证（可选）**
+   - 仅针对 MyBatis XML mapper 中的 `${}` 动态 SQL Sink
+   - 提取 XML 中的污点变量，逆向遍历调用链验证污点传播
+   - 基于类型过滤（数值类型视为安全）和类型敏感性分析（Map key / Class field / List index）
+   - 若逆向验证表明污点不传播，则覆盖 multi-judge 结果
+
+5. **Phase 5 — 结构化报告**
+   - 每条发现包含完整的 source→sink 调用链、代码片段、POC 和修复建议
+
 - 输出: `{"findings": [Finding...]}`
 
 ### vuln_verifier (Layer 2)
 
 独立验证上游所有 Agent 的发现。
 
-- 合并上游 4 个 Agent 的 findings
+- 合并上游 4 个 Agent（auth_auditor、taint_analyzer、hardcoded_auditor、path_traversal_auditor）的 findings
 - 按严重性排序，最多验证 30 条
 - 对每条 finding 执行 5 步验证：确认 Source、确认 Sink、追踪数据流、检查净化措施、分配状态
 - 不信任上游声明，独立阅读源码验证
@@ -264,11 +285,6 @@ python -m code_audit /path/to/project \
   --base-url "https://dashscope.aliyuncs.com/compatible-mode/v1" \
   --model qwen-plus \
   -o /tmp/output -v
-
-# 启用 Pecker 扫描器
-python -m code_audit /path/to/project \
-  --pecker-path /path/to/pecker-3.0-out \
-  -o /tmp/output -v
 ```
 
 ### CLI 参数
@@ -281,7 +297,6 @@ python -m code_audit /path/to/project \
 | `-m, --model` | 模型名称 |
 | `--api-key` | API 密钥 |
 | `--base-url` | API 端点 URL |
-| `--pecker-path` | Pecker 工具路径（省略则跳过 Pecker） |
 | `--max-turns` | 每个 Agent 最大对话轮次 |
 | `--timeout` | 每个 Agent 超时秒数 |
 | `--max-concurrent` | 同层最大并发 Agent 数 |
@@ -352,147 +367,108 @@ python -m code_audit ../project_for_detect/spark \
   --api-key "$QWEN_BAILIAN" \
   --base-url "https://dashscope.aliyuncs.com/compatible-mode/v1" \
   --model qwen-plus \
-  -o /tmp/spark-audit-v2 -v
+  -o /tmp/spark-audit-v4 -v
 ```
 
 ### 执行过程
 
-Pipeline 共 6 个 Stage，按 DAG 拓扑序执行（Pecker 因未配置路径而跳过）：
+Pipeline 共 7 个 Stage，按 DAG 拓扑序执行：
 
 ```
-20:06:10 [INFO] Wukong (悟空) Code Audit
-20:06:10 [INFO] Project:  .../project_for_detect/spark
-20:06:10 [INFO] Provider: openai (qwen-plus via 阿里云百炼)
-20:06:10 [INFO] Pecker:   (disabled)
-20:06:10 [INFO] Skipped agents (not configured): pecker_scanner
-20:06:10 [INFO] Starting pipeline with 6 stages
+21:10:37 [INFO] Wukong (悟空) Code Audit
+21:10:37 [INFO] Project:  .../project_for_detect/spark
+21:10:37 [INFO] Provider: openai (qwen-plus via 阿里云百炼)
+21:10:37 [INFO] Starting pipeline with 7 stages
 
-20:06:10 [STAGE] route_mapper         >>> RUNNING
-20:07:28 [STAGE] route_mapper         >>> SUCCESS      (70 routes, 78s)
+21:10:37 [STAGE] route_mapper              >>> RUNNING
+21:14:54 [STAGE] route_mapper              >>> SUCCESS      (72 routes)
 
-20:07:28 [STAGE] auth_auditor         >>> RUNNING  ─┐
-20:07:28 [STAGE] hardcoded_auditor    >>> RUNNING   ├─ 并行执行
-20:07:28 [STAGE] path_traversal_auditor >>> RUNNING ─┘
+21:14:54 [STAGE] auth_auditor              >>> RUNNING  ─┐
+21:14:54 [STAGE] taint_analyzer            >>> RUNNING   │
+21:14:54 [STAGE] hardcoded_auditor         >>> RUNNING   ├─ 并行执行
+21:14:54 [STAGE] path_traversal_auditor    >>> RUNNING  ─┘
 
-20:09:45 [STAGE] auth_auditor         >>> SUCCESS      (3 findings)
-20:10:12 [STAGE] hardcoded_auditor    >>> SUCCESS      (4 findings)
-20:10:30 [STAGE] path_traversal_auditor >>> SUCCESS    (3 findings)
+21:16:33 [STAGE] hardcoded_auditor         >>> SUCCESS      (4 findings)
+21:16:56 [STAGE] auth_auditor              >>> SUCCESS      (4 findings)
+21:17:20 [STAGE] taint_analyzer            >>> SUCCESS      (0 findings)
+21:19:23 [STAGE] path_traversal_auditor    >>> SUCCESS
 
-20:10:30 [STAGE] vuln_verifier        >>> RUNNING
-20:13:39 [STAGE] vuln_verifier        >>> SUCCESS      (10 verifications)
+21:19:23 [STAGE] vuln_verifier             >>> RUNNING
+21:19:59 [STAGE] vuln_verifier             >>> SUCCESS      (8 verifications)
 
-20:13:39 [STAGE] report_generator     >>> RUNNING
-20:13:39 [STAGE] report_generator     >>> SUCCESS
+21:19:59 [STAGE] report_generator          >>> RUNNING
+21:19:59 [STAGE] report_generator          >>> SUCCESS
 
-20:13:39 [INFO] Pipeline finished in 448.5s — 6 success, 0 failed, 0 skipped
+21:19:59 [INFO] Pipeline finished in 561.5s — 7 success, 0 failed, 0 skipped
 ```
+
+> taint_analyzer 对 SparkJava 返回 0 findings 是正确的 — SparkJava 本身是一个 Web 框架库，不包含 SQL/RCE/XXE/SSRF 的应用层 Sink。taint_analyzer 的价值在于扫描使用数据库、命令执行或 XML 解析的应用代码时。
 
 ### 扫描结果总览
 
 | 指标 | 数值 |
 |------|------|
-| 发现路由数 | 70 |
-| 总发现数 | 10 |
-| 确认漏洞 | 10 |
+| 发现路由数 | 72 |
+| 总发现数 | 8 |
+| 确认漏洞 | 8 |
 | 误报 | 0 |
-| 总耗时 | 448.5 秒 |
+| 总耗时 | 561.5 秒 |
 
 #### 严重性分布
 
 | 严重性 | 数量 |
 |--------|------|
-| Critical | 1 |
 | High | 3 |
-| Medium | 6 |
+| Medium | 4 |
+| Low | 1 |
 
 #### 漏洞类型分布
 
 | 类型 | 数量 |
 |------|------|
-| path_traversal | 3 |
-| auth_bypass | 3 |
+| auth_bypass | 4 |
 | hardcoded | 4 |
 
 ### 发现详情
-
-#### PT-001 [Critical] — CVE-2018-9159 路径穿越
-
-这是本次扫描的核心目标漏洞，被 `path_traversal_auditor` 成功检出。
-
-- **文件**: `spark/staticfiles/DirectoryTraversal.java:19`
-- **Source**: HTTP 请求 URI 路径
-- **Sink**: `new File(file.getPath())` (ExternalResourceHandler)
-- **调用链**:
-  1. `ExternalResourceHandler.getResource(String path)` — 接收用户请求路径
-  2. `DirectoryTraversal.protectAgainstForExternal(String path)` — 尝试检测路径穿越
-
-**漏洞原理**: `DirectoryTraversal.protectAgainstForExternal()` 使用 `Paths.get(path).toAbsolutePath()` 对路径进行规范化，然后检查结果是否以配置的静态文件目录开头。但 URL 编码的穿越序列（如 `%2e%2e%2f` 即 `../`）在安全检查之后才被解码，导致防护被绕过。
-
-**漏洞代码**:
-```java
-public static void protectAgainstForExternal(String path) {
-    String nixLikePath = Paths.get(path).toAbsolutePath()
-                              .toString().replace("\\", "/");
-    if (!removeLeadingAndTrailingSlashesFrom(nixLikePath)
-            .startsWith(StaticFilesFolder.external())) {
-        throw new DirectoryTraversalDetection("external");
-    }
-}
-```
-
-**POC**:
-```http
-GET /static/..%2f..%2f..%2fetc/passwd HTTP/1.1
-Host: target:4567
-```
-
-**验证结果**: vuln_verifier 独立确认 — _"Verified: DirectoryTraversal.java uses Paths.get(path).toAbsolutePath() after URL decoding, making it vulnerable to CVE-2018-9159 encoded path traversal attacks."_
-
-**修复建议**: 升级至 SparkJava 2.7.2 或更高版本。若无法升级，在安全检查前先进行 URL 解码和路径规范化，并采用白名单方式限制可访问的文件扩展名。
-
-#### PT-002 [High] — UriPath.canonical() 路径规范化不足
-
-- **文件**: `spark/resource/UriPath.java:32`
-- **问题**: `UriPath.canonical()` 方法仅处理字面量的 `.` 和 `..`，不处理 URL 编码变体（`%2e`、`%2e%2e`）
-- **POC**: `GET /static/%2e%2e%2f%2e%2e%2f%2e%2e%2fetc/passwd`
-
-#### PT-003 [Medium] — 外部静态文件路径配置缺少验证
-
-- **文件**: `spark/staticfiles/StaticFilesConfiguration.java:161`
-- **问题**: `configureExternal(String folder)` 接受任意文件夹路径，未验证是否在安全范围内
 
 #### AUTH-001 [High] — Book API 缺少认证
 
 - **文件**: `Books.java:44`
 - **问题**: `/books` 的 POST/GET/PUT/DELETE 端点未配置任何认证过滤器
 
-#### AUTH-002 [Medium] — 测试端点暴露
+#### AUTH-002 [High] — 查询参数传递认证凭据
+
+- **文件**: `FilterExample.java:57`
+- **问题**: 认证过滤器从查询参数 `user`/`password` 提取凭据，暴露在日志、浏览器历史和代理日志中
+
+#### AUTH-003 [Medium] — 硬编码认证凭据
+
+- **文件**: `FilterExample.java:51`
+- **问题**: 硬编码凭据 `foo/bar`、`admin/admin` 直接写在源码中
+
+#### AUTH-004 [High] — 未保护的管理端点
 
 - **文件**: `GenericIntegrationTest.java:91`
-- **问题**: `/hi`、`/hello`、`/throwexception` 等测试端点无认证保护
+- **问题**: `/hi`、`/binaryhi`、`/bytebufferhi`、`/inputstreamhi`、`/param/:param` 等端点无认证保护
 
-#### AUTH-003 [High] — 端点保护不一致
-
-- **文件**: `GenericIntegrationTest.java:79`
-- **问题**: `/protected/*` 和 `/secretcontent/*` 有认证过滤器，但功能相似的 `/books/*` 没有
-
-#### HC-001~004 [Medium] — 硬编码凭据
+#### HC-001~004 — 硬编码凭据
 
 | ID | 文件 | 内容 |
 |----|------|------|
 | HC-001 | FilterExample.java:51 | 硬编码认证凭据 `foo/bar`, `admin/admin` |
-| HC-002 | SparkTestUtil.java:277 | 默认 keystore 密码 `password` |
-| HC-003 | ServiceTest.java:184 | SSL 凭据 `keypassword`, `truststorepassword` |
-| HC-004 | SocketConnectorFactoryTest.java:108 | SSL 凭据 `keystorePassword`, `trustStorePassword` |
+| HC-002 | ServiceTest.java:184 | SSL 凭据 `keypassword`, `truststorepassword` |
+| HC-003 | SparkTestUtil.java:277 | 默认 keystore 密码 `password` |
+| HC-004 | README.md:245 | 示例 URL 中的凭据 |
 
 ### 输出文件
 
-扫描完成后在输出目录 `/tmp/spark-audit-v2/` 生成以下文件：
+扫描完成后在输出目录 `/tmp/spark-audit-v4/` 生成以下文件：
 
 | 文件 | 说明 |
 |------|------|
 | `security-audit-report.md` | 完整 Markdown 审计报告 |
 | `report.json` | 结构化 JSON 报告（含所有数据） |
-| `routes.json` | 提取的路由列表 (70 条) |
-| `findings.json` | 所有发现 (10 条) |
-| `verified.json` | 验证结果 (10 条，全部 confirmed) |
+| `routes.json` | 提取的路由列表 (72 条) |
+| `findings.json` | 所有发现 (8 条) |
+| `verified.json` | 验证结果 (8 条，全部 confirmed) |
+| `verifications.json` | 详细验证过程 |

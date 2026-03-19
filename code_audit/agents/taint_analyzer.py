@@ -2,12 +2,18 @@
 
 Re-implements the core taint analysis approach from Pecker as a native
 LLM agent within the wukong framework.  Instead of invoking Pecker as an
-external subprocess, this agent uses the LLM to:
+external subprocess, this agent uses the LLM to perform **forward tracing**
+from web entry points (sources) toward dangerous function calls (sinks):
 
-1. Locate dangerous sinks in code reachable from web entry points
-2. Trace taint (user input) backward from sink to source
-3. Verify findings with multi-judge checks (sink_check, sanitizer_check,
-   input_check, taint_check, etc.)
+1. Start from web entry points discovered by route_mapper
+2. At each method: check if it contains a dangerous sink, AND identify
+   sub-functions worth tracing deeper (the "next_call" step)
+3. Recursively trace into sub-functions up to a configurable depth
+4. When a sink is found, verify with multi-judge checks (sink_check,
+   sanitizer_check, input_check, taint_check, etc.)
+
+This mirrors Pecker's producer/consumer architecture where each method
+is both analysed for sinks and expanded for deeper call tracing.
 
 Layer 1 agent, depends on ``route_mapper``.
 Produces ``{"findings": [Finding...]}``.
@@ -237,48 +243,76 @@ dangerous function calls (sinks) to find real, exploitable vulnerabilities.
 
 ## Analysis Methodology
 
-You MUST follow this systematic 4-phase approach:
+You MUST follow this systematic approach, which mirrors Pecker's \
+forward-tracing producer/consumer architecture. The key insight is that \
+you start from web entry points (sources) and trace FORWARD through the \
+call graph toward dangerous sinks — NOT backward from sinks to sources.
 
-### Phase 1: Identify Entry Points and Locate Sinks
+You act as both a "sink finder" and a "next-call identifier" at each \
+method you analyse. Think of yourself as processing a work queue: you \
+read a method, check it for sinks, then decide which sub-functions to \
+trace deeper.
 
-For each route/entry point discovered by route_mapper:
-1. Use `read_file` to read the handler method for each route
-2. Use `grep_content` to search for dangerous sink patterns in the codebase:
+### Phase 1: Build the Initial Work Queue from Entry Points
+
+1. Use `read_file` to read the handler method for each route discovered by \
+route_mapper. These handlers are your **initial work queue**.
+2. Also use `grep_content` to do a broad sweep for dangerous sink patterns, \
+so you know which files/methods contain sinks (this helps prioritise):
    - SQL sinks: grep for patterns like `executeQuery|executeUpdate|createQuery|\\.query\\(|\\$\\{{|\\.execute\\(|JdbcTemplate|createNativeQuery`
    - RCE sinks: grep for `Runtime\\..*exec|ProcessBuilder|ScriptEngine\\.eval`
    - XXE sinks: grep for `DocumentBuilder|SAXReader|XMLInputFactory|SAXParser|SAXBuilder|Unmarshaller|Transformer\\.transform|DocumentHelper`
    - SSRF sinks: grep for `URL\\(|openConnection|HttpClient|RestTemplate|WebClient|OkHttp`
 3. For MyBatis projects, search XML mapper files: grep for `\\$\\{{` in xml files
-4. Read each file containing a sink to understand the full context
 
 IMPORTANT: Always pass `path="{project_path}"` to grep_content and glob_files.
 
-### Phase 2: Trace Taint from Source to Sink
+### Phase 2: Forward Tracing — Process Each Method (Sink Check + Next-Call)
 
-For each sink found in Phase 1:
-1. Read the method containing the sink call
-2. Identify the parameters that flow into the dangerous function
-3. Trace backward through the call chain:
-   a. Does the parameter come from the method's own parameters?
-   b. If yes, find all callers of this method (use grep_content to search for \
-method name invocations)
-   c. Read each caller and check if the argument passed comes from user input
-   d. Continue tracing up to 4 levels deep
-4. For each level, check:
-   - Is the parameter a numeric type (int, long, boolean)? If so, it cannot \
-carry SQL injection taint — skip it
-   - Is the parameter sanitized/filtered before being passed?
-   - Does the parameter originate from HTTP request parameters, headers, \
-body, or path variables?
+Process each method from your work queue. For each method, perform TWO tasks:
+
+**Task A — Sink Check ("first_sink_chat" equivalent):**
+1. Read the method's source code (with imports, fields, and class context)
+2. Pre-filter: does this method contain ANY calls to known sink functions \
+listed in the sink patterns above? If not, skip to Task B.
+3. If potential sinks exist, determine:
+   - What type of vulnerability? (SQLI / RCE / XXE / SSRF)
+   - Which specific function call is the sink?
+   - What data flows into the sink? Is it user-controlled?
+   - Confidence score (0-10)
+4. If confidence > 0 and a real sink is found, record it as a candidate \
+finding and proceed to Phase 3 (Multi-Judge Verification) for this finding.
+
+**Task B — Next-Call Expansion ("second_vulnerability_chat" equivalent):**
+Regardless of whether a sink was found, analyse the current method for \
+interesting sub-function calls worth tracing deeper:
+1. Identify calls to project-internal methods (not stdlib/framework methods)
+2. For each interesting callee:
+   a. Use `grep_content` to find the callee's definition in the codebase
+   b. Use `read_file` to read its source code
+   c. Add it to your work queue for further analysis
+3. Continue tracing into sub-functions up to **6 levels deep** from the \
+original entry point handler
+4. **Duplicate detection**: Do NOT re-analyse a method you have already \
+analysed in the current call chain (track by file + method name)
+
+**Priority guidance for next-call expansion:**
+- Prioritise methods that receive string/object parameters from the parent
+- Skip methods that only receive numeric primitives (int, long, boolean)
+- Skip standard library and framework utility methods
+- Focus on DAO/repository methods, service methods, and any method that \
+constructs SQL, executes commands, parses XML, or makes HTTP requests
 
 ### Phase 3: Multi-Judge Verification
 
-For each potential vulnerability found in Phase 2, apply ALL relevant checks:
+For each potential vulnerability found in Phase 2, apply ALL relevant \
+checks in order. This is an early-termination pipeline — if ANY check \
+returns True (safe), STOP and discard the finding as a false positive.
 
-**For SQLI vulnerabilities:**
+**For SQLI vulnerabilities (Java):**
 1. sink_check: {sqli_sink_check}
-2. sanitizer_check: {sqli_sanitizer_check}
-3. input_check: {sqli_input_check}
+2. input_check: {sqli_input_check}
+3. sanitizer_check: {sqli_sanitizer_check}
 4. taint_check: {sqli_taint_check}
 
 **For RCE vulnerabilities:**
@@ -302,7 +336,26 @@ For each potential vulnerability found in Phase 2, apply ALL relevant checks:
 A finding is CONFIRMED only if ALL checks return False (unsafe). If ANY \
 check returns True (safe), the finding is a false positive — discard it.
 
-### Phase 4: Report Findings
+### Phase 4: Backward Taint Verification for XML/MyBatis Sinks (Optional)
+
+If a confirmed finding involves a MyBatis XML mapper with `${{...}}` \
+interpolation (dynamic SQL):
+1. Extract the taint variables from the `${{...}}` patterns in the XML
+2. Map each taint variable back to the mapper interface method's parameters
+3. Walk BACKWARD through the accumulated call chain to verify that user \
+input actually reaches the taint variable at each hop:
+   - Check parameter types: numeric types (int, long, Integer, Long, etc.) \
+cannot carry injection payloads → mark as safe
+   - Check for type sensitivity: Map (key-sensitive), class (field-sensitive), \
+List (index-sensitive) — the specific key/field/index must match
+   - Check for sanitization at each hop
+4. If backward verification shows taint does NOT propagate → override the \
+multi-judge result and discard the finding
+
+This backward step is ONLY needed for XML/MyBatis sinks. For direct Java \
+sinks, the forward-tracing + multi-judge checks are sufficient.
+
+### Phase 5: Report Findings
 
 Submit findings using submit_findings with the result_json parameter.
 
@@ -345,14 +398,20 @@ mitigation that can be bypassed
 
 ### Key Analysis Principles
 1. Do NOT guess — read the actual code using read_file and grep_content
-2. Trace the COMPLETE path from user input to sink
-3. Check for sanitization at EVERY hop in the call chain
-4. For MyBatis: #{{param}} is safe (parameterized), ${{param}} is unsafe (interpolated)
-5. Numeric type parameters (int, long, Integer, Long) cannot carry string \
+2. FORWARD trace: start from entry-point handlers, trace into callees, \
+check each method for sinks. Do NOT start from sinks and trace backward.
+3. At each method, always do BOTH: (a) check for sinks, (b) identify \
+sub-functions to trace next — even if no sink is found in the current method
+4. Check for sanitization at EVERY hop in the call chain
+5. For MyBatis: #{{param}} is safe (parameterized), ${{param}} is unsafe (interpolated)
+6. Numeric type parameters (int, long, Integer, Long) cannot carry string \
 injection payloads
-6. Framework-level ORM methods (JPA Criteria API, MyBatis-Plus eq/ne/like) \
+7. Framework-level ORM methods (JPA Criteria API, MyBatis-Plus eq/ne/like) \
 are generally safe unless they accept raw SQL fragments
-7. Consider BOTH direct routes AND internal/service methods called from routes
+8. Track the full call chain from entry point to current method — this is \
+needed for multi-judge verification and for the final finding report
+9. Respect depth limits (max 6 levels) and avoid re-analysing methods \
+already visited in the current call chain
 """
 
 
@@ -411,11 +470,13 @@ async def run_taint_analyzer(config: AuditConfig, inputs: dict) -> dict:
     )
 
     result = await agent.run(
-        f"Perform taint analysis on the project at {config.project_path}. "
-        f"There are {len(routes_data.get('routes', []))} routes discovered. "
-        f"Search for SQLI, RCE, XXE, and SSRF sinks, trace taint from user "
-        f"input sources to those sinks, and verify each finding with "
-        f"multi-judge checks. Report only confirmed vulnerabilities."
+        f"Perform forward-tracing taint analysis on the project at "
+        f"{config.project_path}. There are "
+        f"{len(routes_data.get('routes', []))} routes discovered. "
+        f"Start from each route handler, trace forward into sub-functions "
+        f"(up to 6 levels deep), check each method for SQLI/RCE/XXE/SSRF "
+        f"sinks, and verify each finding with multi-judge checks. "
+        f"Report only confirmed vulnerabilities."
     )
 
     # Normalise output
