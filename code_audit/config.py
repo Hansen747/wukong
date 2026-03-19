@@ -42,6 +42,20 @@ class AuditConfig(BaseModel):
     # Agent timeout seconds, 0 = no timeout
     agent_timeout: int = 0
 
+    # --- Taint analyzer settings ---
+
+    # Number of routes per taint analysis group (route-group parallelism)
+    taint_group_size: int = 10
+
+    # Max concurrent taint analysis groups
+    taint_max_concurrent: int = 3
+
+    # Code resolver backend: "grep" | "tree-sitter" | "lsp"
+    resolver: Literal["grep", "tree-sitter", "lsp"] = "grep"
+
+    # LSP server command (only used when resolver="lsp")
+    lsp_cmd: Optional[str] = None
+
     def model_post_init(self, __context):
         """
         Post-init hook:

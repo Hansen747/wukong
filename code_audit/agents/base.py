@@ -122,6 +122,7 @@ class AuditAgent:
         max_turns: int = 80,
         max_tokens: int = 16384,
         provider: str = "anthropic",
+        context_window_turns: int = 0,
     ) -> None:
         self.client = client
         self.model = model
@@ -131,6 +132,7 @@ class AuditAgent:
         self.max_turns = max_turns
         self.max_tokens = max_tokens
         self.provider = provider
+        self.context_window_turns = context_window_turns  # 0 = no compression
         self._submit_fail_count = 0
 
     # ------------------------------------------------------------------
@@ -265,6 +267,92 @@ class AuditAgent:
         return None
 
     # ------------------------------------------------------------------
+    # Context compression (sliding window)
+    # ------------------------------------------------------------------
+
+    def _compress_messages_openai(self, messages: list[dict]) -> list[dict]:
+        """Apply sliding window compression to OpenAI-format messages.
+
+        Keeps the system message (index 0), the initial user message
+        (index 1), and the last ``context_window_turns`` pairs of
+        messages. Older messages are replaced with a single summary
+        message to preserve continuity.
+
+        A "turn" is an assistant message + its tool result messages.
+        We count backwards from the end to keep the most recent turns.
+        """
+        if self.context_window_turns <= 0:
+            return messages  # no compression
+
+        # Need at least: system + user + some turns to compress
+        # Each "turn" is roughly: assistant msg + 1+ tool msgs
+        # We keep system(0) + user(1) + last N*3 messages (rough heuristic)
+        keep_tail = self.context_window_turns * 3
+        if len(messages) <= 2 + keep_tail:
+            return messages  # not enough to compress
+
+        head = messages[:2]  # system + initial user
+        tail = messages[-keep_tail:]  # recent turns
+
+        # Count how many messages were compressed
+        compressed_count = len(messages) - 2 - keep_tail
+        summary_msg = {
+            "role": "user",
+            "content": (
+                f"[Context compressed: {compressed_count} earlier messages removed. "
+                f"Continue your analysis from where you left off. "
+                f"Remember to track which methods you've already analyzed to avoid "
+                f"duplicates, and submit findings when done.]"
+            ),
+        }
+
+        compressed = head + [summary_msg] + tail
+        logger.debug(
+            "[%s] context compressed: %d -> %d messages",
+            self.name,
+            len(messages),
+            len(compressed),
+        )
+        return compressed
+
+    def _compress_messages_anthropic(self, messages: list[dict]) -> list[dict]:
+        """Apply sliding window compression to Anthropic-format messages.
+
+        Keeps the initial user message (index 0) and the last
+        ``context_window_turns`` pairs. System prompt is passed
+        separately in Anthropic API, so it's not in the messages list.
+        """
+        if self.context_window_turns <= 0:
+            return messages  # no compression
+
+        keep_tail = self.context_window_turns * 3
+        if len(messages) <= 1 + keep_tail:
+            return messages
+
+        head = messages[:1]  # initial user message
+        tail = messages[-keep_tail:]
+
+        compressed_count = len(messages) - 1 - keep_tail
+        summary_msg = {
+            "role": "user",
+            "content": (
+                f"[Context compressed: {compressed_count} earlier messages removed. "
+                f"Continue your analysis from where you left off. "
+                f"Remember to track which methods you've already analyzed to avoid "
+                f"duplicates, and submit findings when done.]"
+            ),
+        }
+
+        compressed = head + [summary_msg] + tail
+        logger.debug(
+            "[%s] context compressed: %d -> %d messages",
+            self.name,
+            len(messages),
+            len(compressed),
+        )
+        return compressed
+
+    # ------------------------------------------------------------------
     # Provider-specific agentic loops
     # ------------------------------------------------------------------
 
@@ -287,6 +375,9 @@ class AuditAgent:
 
         for turn in range(1, self.max_turns + 1 if self.max_turns else 10000):
             logger.info("[%s] turn %d (anthropic)", self.name, turn)
+
+            # Apply sliding window compression if configured
+            messages = self._compress_messages_anthropic(messages)
 
             try:
                 async with self.client.messages.stream(
@@ -383,6 +474,9 @@ class AuditAgent:
 
         for turn in range(1, self.max_turns + 1 if self.max_turns else 10000):
             logger.info("[%s] turn %d (openai)", self.name, turn)
+
+            # Apply sliding window compression if configured
+            messages = self._compress_messages_openai(messages)
 
             try:
                 response = await self.client.chat.completions.create(

@@ -208,6 +208,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--taint-group-size",
+        type=int,
+        default=10,
+        help="Number of routes per taint analysis group (default: 10)",
+    )
+
+    parser.add_argument(
+        "--taint-max-concurrent",
+        type=int,
+        default=3,
+        help="Max concurrent taint analysis groups (default: 3)",
+    )
+
+    parser.add_argument(
+        "--resolver",
+        choices=["grep", "tree-sitter", "lsp"],
+        default="grep",
+        help="Code resolver backend: grep (default), tree-sitter, or lsp",
+    )
+
+    parser.add_argument(
+        "--lsp-cmd",
+        default=None,
+        help="LSP server command (only used with --resolver lsp)",
+    )
+
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -256,6 +283,10 @@ def main(argv: list[str] | None = None) -> None:
         max_concurrent_agents=args.max_concurrent,
         agent_max_turns=args.max_turns,
         agent_timeout=args.timeout,
+        taint_group_size=args.taint_group_size,
+        taint_max_concurrent=args.taint_max_concurrent,
+        resolver=args.resolver,
+        lsp_cmd=args.lsp_cmd,
     )
 
     # Ensure output directory exists
