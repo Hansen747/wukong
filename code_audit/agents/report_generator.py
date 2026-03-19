@@ -169,6 +169,7 @@ def _render_finding(finding: dict, verification: dict | None = None) -> str:
         "auth_auditor",
         "pecker_scanner",
         "hardcoded_auditor",
+        "path_traversal_auditor",
         "route_mapper",
     ],
     timeout=120,
@@ -185,7 +186,7 @@ async def run_report_generator(config: AuditConfig, inputs: dict) -> dict:
     verifications = inputs.get("vuln_verifier", {}).get("verifications", [])
 
     all_findings: list[dict] = []
-    for stage in ("auth_auditor", "pecker_scanner", "hardcoded_auditor"):
+    for stage in ("auth_auditor", "pecker_scanner", "hardcoded_auditor", "path_traversal_auditor"):
         stage_data = inputs.get(stage, {})
         if isinstance(stage_data, dict):
             all_findings.extend(stage_data.get("findings", []))

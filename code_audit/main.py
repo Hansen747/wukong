@@ -40,6 +40,7 @@ def _import_agents() -> None:
     import code_audit.agents.pecker_scanner     # noqa: F401
     import code_audit.agents.auth_auditor       # noqa: F401
     import code_audit.agents.hardcoded_auditor  # noqa: F401
+    import code_audit.agents.path_traversal_auditor  # noqa: F401
     import code_audit.agents.vuln_verifier      # noqa: F401
     import code_audit.agents.report_generator   # noqa: F401
 

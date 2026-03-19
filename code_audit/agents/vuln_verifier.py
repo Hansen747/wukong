@@ -1,7 +1,7 @@
 """Vulnerability verifier agent — independently verifies upstream findings.
 
-Layer 2 agent, depends on ``auth_auditor``, ``pecker_scanner``, and
-``hardcoded_auditor``.
+Layer 2 agent, depends on ``auth_auditor``, ``pecker_scanner``,
+``hardcoded_auditor``, and ``path_traversal_auditor``.
 Produces ``{"verifications": [VerificationResult...]}``.
 """
 
@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 VULN_VERIFIER_PROMPT = """\
 You are a vulnerability verification expert. You will receive a list of \
 potential vulnerabilities discovered by upstream scanners (auth_auditor, \
-pecker_scanner, hardcoded_auditor). Your job is to independently verify \
-each finding by reading the actual source code.
+pecker_scanner, hardcoded_auditor, path_traversal_auditor). Your job is to \
+independently verify each finding by reading the actual source code.
 
 ## Project path
 {project_path}
@@ -103,7 +103,7 @@ MAX_FINDINGS_TO_VERIFY = 30
 @register_agent(
     name="vuln_verifier",
     layer=2,
-    depends_on=["auth_auditor", "pecker_scanner", "hardcoded_auditor"],
+    depends_on=["auth_auditor", "pecker_scanner", "hardcoded_auditor", "path_traversal_auditor"],
     timeout=1800,
     description="Independently verify upstream vulnerability findings",
 )
@@ -113,7 +113,7 @@ async def run_vuln_verifier(config: AuditConfig, inputs: dict) -> dict:
 
     # Merge all upstream findings
     all_findings = []
-    for stage_name in ("auth_auditor", "pecker_scanner", "hardcoded_auditor"):
+    for stage_name in ("auth_auditor", "pecker_scanner", "hardcoded_auditor", "path_traversal_auditor"):
         stage_data = inputs.get(stage_name, {})
         if isinstance(stage_data, dict):
             findings = stage_data.get("findings", [])
