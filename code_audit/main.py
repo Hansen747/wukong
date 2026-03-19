@@ -8,7 +8,10 @@ Usage::
 Example::
 
     python -m code_audit /path/to/project \\
-        --pecker-path /path/to/pecker-3.0-out \\
+        --provider openai \\
+        --api-key "$QWEN_BAILIAN" \\
+        --base-url "https://dashscope.aliyuncs.com/compatible-mode/v1" \\
+        --model qwen-plus \\
         -o /tmp/my-audit \\
         -v
 """
@@ -37,7 +40,7 @@ logger = logging.getLogger("code_audit")
 def _import_agents() -> None:
     """Import every agent module to trigger @register_agent decorators."""
     import code_audit.agents.route_mapper       # noqa: F401
-    import code_audit.agents.pecker_scanner     # noqa: F401
+    import code_audit.agents.taint_analyzer     # noqa: F401
     import code_audit.agents.auth_auditor       # noqa: F401
     import code_audit.agents.hardcoded_auditor  # noqa: F401
     import code_audit.agents.path_traversal_auditor  # noqa: F401
@@ -50,39 +53,23 @@ def _import_agents() -> None:
 # ------------------------------------------------------------------
 
 def build_dag(config: AuditConfig) -> list[Stage]:
-    """Query the agent registry and build Stage objects for the DAG.
-
-    If pecker_path is not set, the pecker_scanner stage is skipped,
-    and its name is removed from other stages' depends_on lists.
-    """
+    """Query the agent registry and build Stage objects for the DAG."""
     stages: list[Stage] = []
-    skipped: set[str] = set()
 
     for meta in agent_registry.all():
-        # Skip pecker_scanner when no pecker path is configured
-        if meta.name == "pecker_scanner" and not config.pecker_path:
-            skipped.add(meta.name)
-            continue
-
         # Use agent-level timeout if set, else fall back to config-level
         timeout = meta.timeout
         if config.agent_timeout > 0:
             timeout = config.agent_timeout
 
-        # Remove skipped agents from depends_on
-        depends_on = [d for d in meta.depends_on if d not in skipped]
-
         stages.append(
             Stage(
                 name=meta.name,
                 agent_factory=meta.factory,
-                depends_on=depends_on,
+                depends_on=list(meta.depends_on),
                 timeout=timeout,
             )
         )
-
-    if skipped:
-        logger.info("Skipped agents (not configured): %s", ", ".join(sorted(skipped)))
 
     # Log the stages we will run
     for s in stages:
@@ -200,24 +187,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--pecker-path",
-        default="",
-        help="Path to pecker-3.0-out directory (omit to skip Pecker scanner)",
-    )
-
-    parser.add_argument(
-        "--pecker-model-type",
-        default="qwen-inner",
-        help="Pecker LLM model type (default: qwen-inner)",
-    )
-
-    parser.add_argument(
-        "--pecker-model-name",
-        default="Qwen2.5-Coder-32B-Instruct",
-        help="Pecker LLM model name (default: Qwen2.5-Coder-32B-Instruct)",
-    )
-
-    parser.add_argument(
         "--max-turns",
         type=int,
         default=0,
@@ -270,14 +239,6 @@ def main(argv: list[str] | None = None) -> None:
         logger.error("Project path does not exist: %s", project_path)
         sys.exit(1)
 
-    # Validate pecker path if provided
-    pecker_path = ""
-    if args.pecker_path:
-        pecker_path = os.path.abspath(args.pecker_path)
-        if not os.path.isdir(pecker_path):
-            logger.error("Pecker path does not exist: %s", pecker_path)
-            sys.exit(1)
-
     # Determine default model based on provider
     provider = args.provider
     model = args.model
@@ -287,9 +248,6 @@ def main(argv: list[str] | None = None) -> None:
     # Build config
     config = AuditConfig(
         project_path=project_path,
-        pecker_path=pecker_path,
-        pecker_model_type=args.pecker_model_type,
-        pecker_model_name=args.pecker_model_name,
         output_dir=args.output_dir,
         provider=provider,
         model=model,
@@ -312,10 +270,6 @@ def main(argv: list[str] | None = None) -> None:
     logger.info("  Output:      %s", config.output_dir)
     logger.info("  Provider:    %s", config.provider)
     logger.info("  Model:       %s", config.model)
-    if config.pecker_path:
-        logger.info("  Pecker:      %s", config.pecker_path)
-    else:
-        logger.info("  Pecker:      (disabled)")
     logger.info("=" * 60)
 
     # Import agents (triggers @register_agent decorators)

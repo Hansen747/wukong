@@ -18,13 +18,6 @@ class AuditConfig(BaseModel):
     # [Required] Project source code root path
     project_path: str
 
-    # Pecker scanner installation path (the pecker-3.0-out directory)
-    pecker_path: str = ""
-
-    # Pecker model configuration
-    pecker_model_type: str = "qwen-inner"
-    pecker_model_name: str = "Qwen2.5-Coder-32B-Instruct"
-
     # Output directory for audit results
     output_dir: Optional[str] = None
 
