@@ -21,11 +21,20 @@ Wukong 是一个基于 DAG（有向无环图）调度的代码安全审计工具
                             │
          ┌──────────────────┼────────────────────┐
          ▼                  ▼                    ▼
-    LLM Agent         LLM Agent            Template Renderer
-   (AuditAgent)     (taint_analyzer)       (report_generator)
+    LLM Agent        taint_analyzer         Template Renderer
+   (AuditAgent)     (Coordinator)          (report_generator)
+         │                  │
+    ┌────┴─────┐      ┌────┴─────────────────────┐
+    │ToolRegistry│      │  Route-Group Parallelism  │
+    └────┬─────┘      │  ┌─────┐ ┌─────┐ ┌─────┐ │
+         │            │  │Grp 1│ │Grp 2│ │Grp 3│ │  ←── asyncio.gather + Semaphore
+         │            │  └──┬──┘ └──┬──┘ └──┬──┘ │
+         │            │     │       │       │     │
+         │            │  AuditAgent sessions      │
+         │            └───────────────────────────┘
          │
     ┌────┴─────┐
-    │ToolRegistry │  ←── read_file / glob_files / grep_content / write_file
+    │CodeResolver│  ←── grep (default) / tree-sitter / LSP
     └──────────┘
 ```
 
@@ -66,20 +75,23 @@ wukong/
 │   │   ├── verification.py       # VerificationResult
 │   │   └── report.py             # AuditReport
 │   ├── tools/
-│   │   ├── registry.py           # ToolRegistry — 管理 Agent 可调用的工具
+│   │   ├── registry.py           # ToolRegistry — 管理 Agent 可调用的工具 + 代码解析工具
 │   │   ├── file_tools.py         # read_file, glob_files, grep_content, write_file, append_file
-│   │   └── bash_tools.py         # run_command (shell 执行)
+│   │   ├── bash_tools.py         # run_command (shell 执行)
+│   │   ├── code_resolver.py      # CodeResolver ABC + GrepResolver + create_resolver()
+│   │   ├── tree_sitter_resolver.py   # TreeSitterResolver (AST 级解析, 需 tree-sitter)
+│   │   └── lsp_resolver.py       # LSPResolver (编译器级解析, 需 LSP 服务器)
 │   ├── pipeline/
 │   │   ├── stage.py              # Stage 数据类
 │   │   └── dag.py                # DAGScheduler — Kahn 拓扑排序 + asyncio.gather
 │   └── agents/
 │       ├── registry.py           # AgentRegistry + @register_agent 装饰器
-│       ├── base.py               # AuditAgent — 双 Provider 流式工具调用循环
+│       ├── base.py               # AuditAgent — 双 Provider 工具调用循环 + 滑动窗口上下文压缩
 │       ├── route_mapper.py       # Layer 0: HTTP 路由提取
 │       ├── auth_auditor.py       # Layer 1: 认证/授权漏洞审计
 │       ├── hardcoded_auditor.py  # Layer 1: 硬编码密钥/凭据检测
 │       ├── path_traversal_auditor.py  # Layer 1: 路径穿越漏洞检测
-│       ├── taint_analyzer.py     # Layer 1: LLM 驱动的污点分析 (SQLI/RCE/XXE/SSRF)
+│       ├── taint_analyzer.py     # Layer 1: 协调器 + 路由分组并行污点分析
 │       ├── vuln_verifier.py      # Layer 2: 独立源码验证
 │       └── report_generator.py   # Layer 3: Markdown/JSON 报告生成
 ```
@@ -101,6 +113,10 @@ wukong/
 | `max_concurrent_agents` | 同层最大并发数 | 3 |
 | `agent_max_turns` | 每个 Agent 最大对话轮次 | 0 (不限) |
 | `agent_timeout` | 每个 Agent 超时 (秒) | 0 (使用 Agent 默认值) |
+| `taint_group_size` | 污点分析每组路由数 | 10 |
+| `taint_max_concurrent` | 污点分析最大并发组数 | 3 |
+| `resolver` | 代码解析后端 | `"grep"` |
+| `lsp_cmd` | LSP 服务器启动命令 | `None` |
 
 ### 2. @register_agent 装饰器
 
@@ -126,7 +142,7 @@ async def run_path_traversal_auditor(config: AuditConfig, inputs: dict) -> dict:
 
 ### 3. AuditAgent — 双 Provider 智能体循环
 
-`AuditAgent` 驱动 LLM 的流式工具调用循环，支持两种 Provider：
+`AuditAgent` 驱动 LLM 的工具调用循环，支持两种 Provider：
 
 - **Anthropic**: 使用 `AsyncAnthropic` + `client.messages.stream()`
 - **OpenAI**: 使用 `AsyncOpenAI` + `client.chat.completions.create()`（兼容阿里云百炼等 OpenAI 兼容接口）
@@ -143,9 +159,17 @@ async def run_path_traversal_auditor(config: AuditConfig, inputs: dict) -> dict:
 - 连续 3 次提交失败后，回退到从 LLM 文本输出中提取 JSON
 - 达到最大轮次时，尝试从最后文本提取 JSON
 
+**滑动窗口上下文压缩** (`context_window_turns` 参数)：
+- 对话轮次过多时，自动压缩旧消息以控制上下文窗口
+- 保留策略：系统提示词 + 首条用户消息 + 最后 N×3 条消息（N = `context_window_turns`）
+- 中间的旧消息被替换为 `[Earlier conversation compressed — N turns removed]`
+- taint_analyzer 的分组 Agent 默认 `context_window_turns=20`，防止大型代码库分析时上下文溢出
+
 ### 4. ToolRegistry
 
 管理 Agent 可调用的工具集，以 Anthropic tool 格式存储，运行时自动转换为 OpenAI 格式：
+
+**基础工具（所有 Agent 均可使用）：**
 
 | 工具 | 说明 |
 |------|------|
@@ -156,7 +180,30 @@ async def run_path_traversal_auditor(config: AuditConfig, inputs: dict) -> dict:
 | `append_file(path, content)` | 追加文件 |
 | `run_command(command)` | 执行 shell 命令 |
 
-### 5. DAGScheduler
+**代码解析工具（通过 `--resolver` 启用，仅 taint_analyzer 使用）：**
+
+| 工具 | 说明 |
+|------|------|
+| `find_definition(symbol, context_file?)` | 查找方法/类/字段的定义位置 |
+| `find_references(symbol, context_file?)` | 查找符号的所有引用位置 |
+| `extract_function_calls(file_path, method_name)` | 提取方法体中的所有函数调用（含 internal/external 分类） |
+| `get_type_info(symbol, context_file)` | 获取变量的类型信息（数值/字符串/集合） |
+
+代码解析工具通过 `ToolRegistry.for_llm_agent(resolver=resolver)` 注册，底层由 `CodeResolver` 实现。使用线程池 Executor 桥接异步调用，避免事件循环冲突。
+
+### 5. CodeResolver — 多后端代码解析
+
+`CodeResolver` 是代码符号解析的抽象层，支持三种后端实现：
+
+| 后端 | CLI 参数 | 依赖 | 精度 | 说明 |
+|------|----------|------|------|------|
+| **GrepResolver** | `--resolver grep` (默认) | 无 | 基础 | 正则匹配，零依赖，适合快速扫描 |
+| **TreeSitterResolver** | `--resolver tree-sitter` | `tree-sitter`, `tree-sitter-java` | AST 级 | 使用 tree-sitter 解析 AST，精确提取函数定义和调用，支持 Sink 预过滤 |
+| **LSPResolver** | `--resolver lsp` | LSP 服务器 | 编译器级 | 通过 JSON-RPC stdio 与 LSP 服务器通信，提供最精确的类型信息和定义跳转 |
+
+工厂函数 `create_resolver(project_path, resolver_type, **kwargs)` 自动创建对应实现。tree-sitter 和 LSP 后端在依赖不可用时会优雅降级到 GrepResolver。
+
+### 6. DAGScheduler
 
 基于 Kahn 拓扑排序算法的调度器：
 
@@ -208,14 +255,49 @@ async def run_path_traversal_auditor(config: AuditConfig, inputs: dict) -> dict:
 
 LLM 驱动的原生污点分析，覆盖 SQLI / RCE / XXE / SSRF 四类漏洞。
 
-此 Agent 取代了之前基于子进程调用的 Pecker 扫描器，将污点分析逻辑以原生 LLM Agent 形式重新实现。核心方法论来自 Pecker 的 **正向追踪（Source→Sink）生产者/消费者** 架构，由 LLM 驱动代码理解和追踪：
+此 Agent 取代了之前基于子进程调用的 Pecker 扫描器，将污点分析逻辑以原生 LLM Agent 形式重新实现。核心方法论来自 Pecker 的 **正向追踪（Source→Sink）生产者/消费者** 架构。
 
-**分析流程（5 阶段）：**
+#### 协调器架构
+
+taint_analyzer 采用 **协调器 + 分组并行** 模式，无需额外 LLM 调用即可拆分工作：
+
+```
+taint_analyzer (协调器, 非 LLM)
+        │
+        ├── Step 1: Pre-scan (grep, 零 LLM 成本)
+        │   └── 在代码库中搜索 4 类 Sink 模式 (SQLI/RCE/XXE/SSRF)
+        │       并记录文件位置，作为优先级参考
+        │
+        ├── Step 2: 路由分组 (taint_group_size=10)
+        │   └── 57 routes → 6 groups
+        │
+        ├── Step 3: 并行分析 (asyncio.gather + Semaphore)
+        │   ┌───────────┬───────────┬───────────┐
+        │   │  Group 1  │  Group 2  │  Group 3  │  ← max_concurrent=3
+        │   │ AuditAgent│ AuditAgent│ AuditAgent│
+        │   │ 10 routes │ 10 routes │ 10 routes │
+        │   └─────┬─────┴─────┬─────┴─────┬─────┘
+        │         │           │           │
+        │   ┌─────┴─────┬─────┘           │
+        │   │  Group 4  │  Group 5  Group 6│  ← Semaphore 释放后启动
+        │   └───────────┴─────────────────┘
+        │
+        └── Step 4: 合并去重 (file_path + line_number + type)
+            └── 写入 taint-findings.json
+```
+
+每个分组 Agent 是一个独立的 `AuditAgent` 会话，具备：
+- 完整的方法论提示词（5 阶段分析流程）
+- 自己的 Sink 模式库（54+ SQL、6+ RCE、51+ XXE、SSRF）
+- 自己分配的路由子集 + 预扫描的 Sink 位置
+- CodeResolver 工具（find_definition、find_references 等）
+- 滑动窗口上下文压缩（`context_window_turns=20`）
+
+#### 分析流程（每个分组 Agent 内部）
 
 1. **Phase 1 — 构建初始工作队列**
-   - 根据 route_mapper 提供的路由列表，读取每个 handler 的源码，作为初始工作队列
-   - 通过 `grep_content` 在代码库中广泛搜索 4 类危险 Sink 模式，帮助优先排序
-   - 内嵌 54+ SQL 注入 Sink、6+ RCE Sink、51+ XXE Sink、SSRF Sink 的匹配规则
+   - 读取每个 handler 的源码，作为初始工作队列
+   - 参考预扫描 Sink 位置优先排序分析目标
 
 2. **Phase 2 — 正向追踪（Sink Check + Next-Call 展开）**
    - 对每个方法执行两个任务：
@@ -237,7 +319,6 @@ LLM 驱动的原生污点分析，覆盖 SQLI / RCE / XXE / SSRF 四类漏洞。
    - 仅针对 MyBatis XML mapper 中的 `${}` 动态 SQL Sink
    - 提取 XML 中的污点变量，逆向遍历调用链验证污点传播
    - 基于类型过滤（数值类型视为安全）和类型敏感性分析（Map key / Class field / List index）
-   - 若逆向验证表明污点不传播，则覆盖 multi-judge 结果
 
 5. **Phase 5 — 结构化报告**
    - 每条发现包含完整的 source→sink 调用链、代码片段、POC 和修复建议
@@ -289,18 +370,22 @@ python -m code_audit /path/to/project \
 
 ### CLI 参数
 
-| 参数 | 说明 |
-|------|------|
-| `project_path` | 待审计项目根路径 |
-| `-o, --output-dir` | 输出目录 |
-| `--provider` | `anthropic` 或 `openai` |
-| `-m, --model` | 模型名称 |
-| `--api-key` | API 密钥 |
-| `--base-url` | API 端点 URL |
-| `--max-turns` | 每个 Agent 最大对话轮次 |
-| `--timeout` | 每个 Agent 超时秒数 |
-| `--max-concurrent` | 同层最大并发 Agent 数 |
-| `-v, --verbose` | 启用 DEBUG 日志 |
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `project_path` | 待审计项目根路径 | (必填) |
+| `-o, --output-dir` | 输出目录 | `/tmp/{project}-audit` |
+| `--provider` | `anthropic` 或 `openai` | `anthropic` |
+| `-m, --model` | 模型名称 | 自动选择 |
+| `--api-key` | API 密钥 | 从环境变量读取 |
+| `--base-url` | API 端点 URL | 从环境变量读取 |
+| `--max-turns` | 每个 Agent 最大对话轮次 | 0 (不限) |
+| `--timeout` | 每个 Agent 超时秒数 | 0 (使用默认) |
+| `--max-concurrent` | 同层最大并发 Agent 数 | 3 |
+| `--resolver` | 代码解析后端: `grep`, `tree-sitter`, `lsp` | `grep` |
+| `--taint-group-size` | 污点分析每组路由数量 | 10 |
+| `--taint-max-concurrent` | 污点分析最大并发组数 | 3 |
+| `--lsp-cmd` | LSP 服务器启动命令 (仅 `--resolver lsp`) | 无 |
+| `-v, --verbose` | 启用 DEBUG 日志 | 关闭 |
 
 ## 扩展新 Agent
 
@@ -367,39 +452,46 @@ python -m code_audit ../project_for_detect/spark \
   --api-key "$QWEN_BAILIAN" \
   --base-url "https://dashscope.aliyuncs.com/compatible-mode/v1" \
   --model qwen-plus \
-  -o /tmp/spark-audit-v4 -v
+  -o /tmp/spark-audit-v6 -v
 ```
 
 ### 执行过程
 
-Pipeline 共 7 个 Stage，按 DAG 拓扑序执行：
+Pipeline 共 7 个 Stage，按 DAG 拓扑序执行。taint_analyzer 自动将 57 条路由拆分为 6 组并行分析：
 
 ```
-21:10:37 [INFO] Wukong (悟空) Code Audit
-21:10:37 [INFO] Project:  .../project_for_detect/spark
-21:10:37 [INFO] Provider: openai (qwen-plus via 阿里云百炼)
-21:10:37 [INFO] Starting pipeline with 7 stages
+00:18:28 [INFO] Wukong (悟空) Code Audit
+00:18:28 [INFO] Project:  .../project_for_detect/spark
+00:18:28 [INFO] Provider: openai (qwen-plus via 阿里云百炼)
+00:18:28 [INFO] Starting pipeline with 7 stages
 
-21:10:37 [STAGE] route_mapper              >>> RUNNING
-21:14:54 [STAGE] route_mapper              >>> SUCCESS      (72 routes)
+00:18:28 [STAGE] route_mapper              >>> RUNNING
+00:24:16 [STAGE] route_mapper              >>> SUCCESS      (57 routes)
 
-21:14:54 [STAGE] auth_auditor              >>> RUNNING  ─┐
-21:14:54 [STAGE] taint_analyzer            >>> RUNNING   │
-21:14:54 [STAGE] hardcoded_auditor         >>> RUNNING   ├─ 并行执行
-21:14:54 [STAGE] path_traversal_auditor    >>> RUNNING  ─┘
+00:24:16 [STAGE] auth_auditor              >>> RUNNING  ─┐
+00:24:16 [STAGE] taint_analyzer            >>> RUNNING   │
+00:24:16 [STAGE] hardcoded_auditor         >>> RUNNING   ├─ 并行执行 (Layer 1)
+00:24:16 [STAGE] path_traversal_auditor    >>> RUNNING  ─┘
 
-21:16:33 [STAGE] hardcoded_auditor         >>> SUCCESS      (4 findings)
-21:16:56 [STAGE] auth_auditor              >>> SUCCESS      (4 findings)
-21:17:20 [STAGE] taint_analyzer            >>> SUCCESS      (0 findings)
-21:19:23 [STAGE] path_traversal_auditor    >>> SUCCESS
+00:24:16 [taint_analyzer] split into 6 groups (size=10, max_concurrent=3)
+00:24:16 [taint_analyzer] group 1 starting — 10 routes  ─┐
+00:24:16 [taint_analyzer] group 2 starting — 10 routes   ├─ 前 3 组并行
+00:24:16 [taint_analyzer] group 3 starting — 10 routes  ─┘
+00:25:25 [STAGE] auth_auditor              >>> SUCCESS      (3 findings)
+00:25:42 [taint_analyzer] group 4 starting — 10 routes     ← Semaphore 释放
+00:25:44 [STAGE] hardcoded_auditor         >>> SUCCESS      (4 findings)
+00:26:58 [taint_analyzer] group 5 starting — 10 routes
+00:27:03 [taint_analyzer] group 6 starting — 7 routes
+00:30:18 [STAGE] path_traversal_auditor    >>> SUCCESS
+00:31:03 [STAGE] taint_analyzer            >>> SUCCESS      (0 findings)
 
-21:19:23 [STAGE] vuln_verifier             >>> RUNNING
-21:19:59 [STAGE] vuln_verifier             >>> SUCCESS      (8 verifications)
+00:31:03 [STAGE] vuln_verifier             >>> RUNNING
+00:31:40 [STAGE] vuln_verifier             >>> SUCCESS      (7 verifications)
 
-21:19:59 [STAGE] report_generator          >>> RUNNING
-21:19:59 [STAGE] report_generator          >>> SUCCESS
+00:31:40 [STAGE] report_generator          >>> RUNNING
+00:31:40 [STAGE] report_generator          >>> SUCCESS
 
-21:19:59 [INFO] Pipeline finished in 561.5s — 7 success, 0 failed, 0 skipped
+00:31:40 [INFO] Pipeline finished in ~793s — 7 success, 0 failed, 0 skipped
 ```
 
 > taint_analyzer 对 SparkJava 返回 0 findings 是正确的 — SparkJava 本身是一个 Web 框架库，不包含 SQL/RCE/XXE/SSRF 的应用层 Sink。taint_analyzer 的价值在于扫描使用数据库、命令执行或 XML 解析的应用代码时。
@@ -408,17 +500,17 @@ Pipeline 共 7 个 Stage，按 DAG 拓扑序执行：
 
 | 指标 | 数值 |
 |------|------|
-| 发现路由数 | 72 |
-| 总发现数 | 8 |
-| 确认漏洞 | 8 |
+| 发现路由数 | 57 |
+| 总发现数 | 7 |
+| 确认漏洞 | 7 |
 | 误报 | 0 |
-| 总耗时 | 561.5 秒 |
+| 总耗时 | ~793 秒 |
 
 #### 严重性分布
 
 | 严重性 | 数量 |
 |--------|------|
-| High | 3 |
+| High | 2 |
 | Medium | 4 |
 | Low | 1 |
 
@@ -426,7 +518,7 @@ Pipeline 共 7 个 Stage，按 DAG 拓扑序执行：
 
 | 类型 | 数量 |
 |------|------|
-| auth_bypass | 4 |
+| auth_bypass | 3 |
 | hardcoded | 4 |
 
 ### 发现详情
@@ -436,39 +528,35 @@ Pipeline 共 7 个 Stage，按 DAG 拓扑序执行：
 - **文件**: `Books.java:44`
 - **问题**: `/books` 的 POST/GET/PUT/DELETE 端点未配置任何认证过滤器
 
-#### AUTH-002 [High] — 查询参数传递认证凭据
+#### AUTH-002 [Medium] — 工具端点缺少认证
 
-- **文件**: `FilterExample.java:57`
-- **问题**: 认证过滤器从查询参数 `user`/`password` 提取凭据，暴露在日志、浏览器历史和代理日志中
+- **文件**: `GenericIntegrationTest.java:150`
+- **问题**: `/ip`、`/session_reset`、`/throwexception` 等端点公开可访问，无认证保护
 
-#### AUTH-003 [Medium] — 硬编码认证凭据
+#### AUTH-003 [High] — 路由认证保护不一致
 
-- **文件**: `FilterExample.java:51`
-- **问题**: 硬编码凭据 `foo/bar`、`admin/admin` 直接写在源码中
-
-#### AUTH-004 [High] — 未保护的管理端点
-
-- **文件**: `GenericIntegrationTest.java:91`
-- **问题**: `/hi`、`/binaryhi`、`/bytebufferhi`、`/inputstreamhi`、`/param/:param` 等端点无认证保护
+- **文件**: `GenericIntegrationTest.java:79`
+- **问题**: `/protected/*` 和 `/secretcontent/*` 有认证过滤器，但 `/hi`、`/binaryhi` 等路由未保护
 
 #### HC-001~004 — 硬编码凭据
 
-| ID | 文件 | 内容 |
-|----|------|------|
-| HC-001 | FilterExample.java:51 | 硬编码认证凭据 `foo/bar`, `admin/admin` |
-| HC-002 | ServiceTest.java:184 | SSL 凭据 `keypassword`, `truststorepassword` |
-| HC-003 | SparkTestUtil.java:277 | 默认 keystore 密码 `password` |
-| HC-004 | README.md:245 | 示例 URL 中的凭据 |
+| ID | 严重性 | 文件 | 内容 |
+|----|--------|------|------|
+| HC-001 | Medium | SparkTestUtil.java:277 | 默认 keystore 密码 `password` |
+| HC-002 | Medium | FilterExample.java:51 | 硬编码认证凭据 `foo/bar`, `admin/admin` |
+| HC-003 | Medium | ServiceTest.java:184 | SSL 凭据 `keypassword`, `truststorepassword` |
+| HC-004 | Low | README.md:245 | 示例 URL 中的凭据 |
 
 ### 输出文件
 
-扫描完成后在输出目录 `/tmp/spark-audit-v4/` 生成以下文件：
+扫描完成后在输出目录 `/tmp/spark-audit-v6/` 生成以下文件：
 
 | 文件 | 说明 |
 |------|------|
 | `security-audit-report.md` | 完整 Markdown 审计报告 |
 | `report.json` | 结构化 JSON 报告（含所有数据） |
-| `routes.json` | 提取的路由列表 (72 条) |
-| `findings.json` | 所有发现 (8 条) |
-| `verified.json` | 验证结果 (8 条，全部 confirmed) |
+| `routes.json` | 提取的路由列表 (57 条) |
+| `findings.json` | 所有发现 (7 条) |
+| `verified.json` | 验证结果 (7 条，全部 confirmed) |
 | `verifications.json` | 详细验证过程 |
+| `taint-findings.json` | 污点分析发现 (本次为空) |
