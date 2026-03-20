@@ -116,42 +116,71 @@ SSRF_SINKS = """
 
 MULTI_JUDGE_CHECKS = {
     "sqli": {
+        # Java SQLI check order (6 checks — matches Pecker exactly):
+        # sink_check -> xml_taint_num_check -> sink_taint_fixed_check ->
+        # sink_taint_exist_check -> sanitizer_check -> taint_check
         "sink_check": (
             "Analyze the code and determine: Are the SQL queries constructed using "
-            "ONLY parameterized queries (PreparedStatement with ?, MyBatis #{}, "
-            "JPA :param)? If ALL SQL is parameterized -> safe (no vuln). "
+            "ONLY parameterized queries (PreparedStatement with ? placeholders, "
+            "MyBatis #{param}, JPA :param, or ORM Criteria API)? "
+            "If ALL SQL is parameterized → return True (safe, no vuln). "
             "If ANY SQL uses string concatenation (+), String.format(), "
-            "MyBatis ${}, or dynamic table/column names -> unsafe (vuln exists). "
-            "Return True if safe (no vulnerability), False if unsafe."
+            "MyBatis ${param}, or dynamic table/column names built from variables → "
+            "return False (unsafe, vuln exists). "
+            "IMPORTANT: MyBatis #{...} is parameterized (safe), ${...} is string "
+            "interpolation (unsafe). Do NOT confuse the two."
+        ),
+        "xml_taint_num_check": (
+            "For MyBatis XML mapper sinks with ${...} interpolation: "
+            "Check if ALL taint variables inside ${...} patterns are numeric types "
+            "(byte, short, int, Integer, long, Long, float, double, boolean, "
+            "or List<numeric>). Numeric types CANNOT carry SQL injection payloads. "
+            "Return True if ALL ${...} variables are numeric types (safe). "
+            "Return False if ANY ${...} variable is a String, Object, Map, or "
+            "other non-numeric type. "
+            "If no MyBatis ${...} patterns exist, skip this check (return False)."
+        ),
+        "sink_taint_fixed_check": (
+            "Check if the parameters flowing into the SQL sink are hardcoded "
+            "constants, compile-time constants (static final), or fixed values "
+            "that cannot be influenced by user input. "
+            "Return True if ALL taint parameters are hardcoded/constant (safe). "
+            "Return False if any parameter comes from a variable or method return."
+        ),
+        "sink_taint_exist_check": (
+            "For MyBatis XML sinks: verify that ${...} taint variables actually "
+            "exist in the SQL statement. Sometimes the XML file has been sanitized "
+            "or the ${...} has been replaced with #{...} in a newer version. "
+            "Return True if there are NO ${...} patterns in the SQL (safe). "
+            "Return False if ${...} patterns are present (taint exists)."
         ),
         "sanitizer_check": (
             "Analyze the code for SQL injection sanitization. Check if ALL "
             "user-controlled variables that reach SQL queries are validated via: "
-            "whitelist validation, enum constraints, strict regex, or type casting "
-            "to numeric types. Return True if effective sanitization exists for "
-            "ALL risky variables, False otherwise."
-        ),
-        "input_check": (
-            "Determine if the route/endpoint method receives external user input. "
-            "If it does NOT receive user input, return True (safe). "
-            "If ALL user input parameters are numeric types (int, long, boolean, "
-            "float, double, Integer, Long), return True (safe). "
-            "If ANY parameter is a non-numeric type (String, Object, Map, etc.), "
-            "return False (potentially unsafe)."
+            "whitelist validation, enum constraints, strict regex, type casting "
+            "to numeric types, or authorization/permission checks that limit "
+            "the controllable input space. "
+            "Return True if effective sanitization exists for ALL risky variables. "
+            "Return False if any variable reaches the sink without sanitization."
         ),
         "taint_check": (
             "Trace the flow of user input through the code. Does any non-numeric "
             "user-controlled parameter flow into a SQL sink (directly or through "
-            "intermediate method calls)? Consider parameter passing, field access, "
-            "and method chaining. Return True if taint does NOT reach the sink "
-            "(safe), False if it does reach the sink (vulnerable)."
+            "intermediate method calls, field access, method chaining, or Map gets)? "
+            "Consider type sensitivity: Map values are key-sensitive, Objects are "
+            "field-sensitive, Lists are index-sensitive. "
+            "Return True if taint does NOT reach the sink (safe). "
+            "Return False if taint reaches the sink (vulnerable)."
         ),
     },
     "rce": {
+        # RCE check order (same across Java/Go/Python):
+        # sink_check -> input_check -> sanitizer_check -> taint_check
         "sink_check": (
             "Determine if the code calls command execution functions: "
-            "Runtime.getRuntime().exec(), ProcessBuilder, or third-party "
-            "command execution utilities (e.g., RuntimeUtil.exec()). "
+            "Runtime.getRuntime().exec(), ProcessBuilder, ProcessBuilder.start(), "
+            "ScriptEngine.eval(), or third-party command execution utilities "
+            "(e.g., RuntimeUtil.exec(), commons-exec). "
             "If such functions are called, return False (dangerous sink exists). "
             "Otherwise return True (no dangerous sink)."
         ),
@@ -175,6 +204,8 @@ MULTI_JUDGE_CHECKS = {
         ),
     },
     "xxe": {
+        # XXE check order (Java/Python):
+        # sink_check -> input_check -> feature_check -> taint_check
         "sink_check": (
             "Check if the code uses known XXE-vulnerable XML parsing libraries: "
             "DocumentBuilderFactory, SAXParserFactory, DOM4J, XMLInputFactory, "
@@ -183,19 +214,21 @@ MULTI_JUDGE_CHECKS = {
             "If such a library is used, return False (dangerous sink). "
             "Otherwise return True."
         ),
-        "feature_check": (
-            "Check if the XML parser has explicit security features configured: "
-            "- disallow-doctype-decl = true "
-            "- external-general-entities = false "
-            "- external-parameter-entities = false "
-            "If security features are properly configured, return True (safe). "
-            "Otherwise return False."
-        ),
         "input_check": (
             "Determine if the XML content being parsed comes from user input "
             "(HTTP request body, uploaded file, user-provided URL). "
             "If the XML is from a trusted internal source only, return True (safe). "
             "If user can control the XML content, return False."
+        ),
+        "feature_check": (
+            "Check if the XML parser has explicit security features configured: "
+            "- disallow-doctype-decl = true "
+            "- external-general-entities = false "
+            "- external-parameter-entities = false "
+            "- XMLConstants.ACCESS_EXTERNAL_DTD = '' "
+            "- XMLConstants.ACCESS_EXTERNAL_SCHEMA = '' "
+            "If security features are properly configured, return True (safe). "
+            "Otherwise return False."
         ),
         "taint_check": (
             "Trace whether user-controlled XML data reaches the XML parsing sink. "
@@ -203,6 +236,8 @@ MULTI_JUDGE_CHECKS = {
         ),
     },
     "ssrf": {
+        # SSRF check order:
+        # sink_check -> input_check -> sanitizer_check -> taint_check
         "sink_check": (
             "Check if the code makes HTTP/network requests using: "
             "URL.openConnection(), HttpURLConnection, HttpClient, RestTemplate, "
@@ -227,8 +262,125 @@ MULTI_JUDGE_CHECKS = {
     },
 }
 
+# Check orders per language/vuln type (matches Pecker exactly)
+MULTI_JUDGE_CHECK_ORDERS = {
+    "java": {
+        "sqli": ["sink_check", "xml_taint_num_check", "sink_taint_fixed_check",
+                 "sink_taint_exist_check", "sanitizer_check", "taint_check"],
+        "rce": ["sink_check", "input_check", "sanitizer_check", "taint_check"],
+        "xxe": ["sink_check", "input_check", "feature_check", "taint_check"],
+        "ssrf": ["sink_check", "input_check", "sanitizer_check", "taint_check"],
+    },
+    "go": {
+        "sqli": ["function_check", "sink_check", "input_check", "sanitizer_check", "taint_check"],
+        "rce": ["sink_check", "input_check", "sanitizer_check", "taint_check"],
+    },
+    "python": {
+        "sqli": ["function_check", "sink_check", "input_check", "sanitizer_check", "taint_check"],
+        "rce": ["sink_check", "input_check", "sanitizer_check", "taint_check"],
+        "xxe": ["sink_check", "input_check", "feature_check", "taint_check"],
+    },
+}
+
+# Additional checks for Go/Python (function_check — ORM framework detection)
+FUNCTION_CHECK = {
+    "go": (
+        "Check if the SQL operations use a safe ORM framework (GORM, sqlx with "
+        "named parameters, Ent, XORM with builder methods). If the code uses "
+        "ORM methods that automatically parameterize queries (e.g., db.Where(), "
+        "db.Find(), sqlx.NamedExec with :param), return True (safe). "
+        "If it uses raw SQL via db.Raw(), db.Exec() with string concatenation, "
+        "or fmt.Sprintf() for SQL building, return False (unsafe)."
+    ),
+    "python": (
+        "Check if the SQL operations use a safe ORM framework (SQLAlchemy ORM, "
+        "Django ORM, Peewee, Tortoise ORM). If the code uses ORM methods that "
+        "automatically parameterize queries (e.g., Model.objects.filter(), "
+        "session.query().filter(), %s placeholders with params tuple), return "
+        "True (safe). If it uses raw SQL via connection.execute() with f-strings, "
+        ".format(), or % string formatting, return False (unsafe)."
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# Structured sink definitions (Pecker's ClassName#method format)
+# These are the authoritative definitions — grep patterns are derived from them.
+# ---------------------------------------------------------------------------
+
+STRUCTURED_SINKS = {
+    "sqli": {
+        # JDBC core
+        "java.sql.Statement": ["executeQuery", "executeUpdate", "addBatch", "executeLargeUpdate", "execute"],
+        "java.sql.Connection": ["prepareStatement", "prepareCall", "nativeSQL"],
+        # JPA
+        "javax.persistence.EntityManager": ["createQuery", "createNativeQuery"],
+        "jakarta.persistence.EntityManager": ["createQuery", "createNativeQuery"],
+        # Spring JdbcTemplate (and subclasses)
+        "*.JdbcTemplate": ["batchUpdate", "execute", "update", "queryForList",
+                           "queryForObject", "queryForMap", "queryForRowSet", "query"],
+        "*.NamedParameterJdbcTemplate": ["batchUpdate", "execute", "update",
+                                          "queryForList", "queryForObject", "query"],
+        # Hibernate
+        "org.hibernate.Session": ["createQuery", "createSQLQuery", "createNativeQuery"],
+        "org.hibernate.SharedSessionContract": ["createQuery", "createSQLQuery", "createNativeQuery"],
+        # MyBatis-Plus (raw SQL methods)
+        "com.baomidou.mybatisplus.core.mapper.BaseMapper": ["selectList", "selectOne"],
+        # InfluxDB
+        "org.influxdb.InfluxDB": ["query"],
+        # PageHelper
+        "com.github.pagehelper.PageHelper": ["orderBy", "setOrderBy"],
+        # Ebean
+        "io.ebean.Database": ["createSqlQuery", "createSqlUpdate"],
+        "io.ebean.Ebean": ["createSqlQuery", "createSqlUpdate"],
+        # Nutz
+        "org.nutz.dao.Dao": ["execute"],
+        # ClickHouse
+        "ru.yandex.clickhouse.ClickHouseDataSource": ["<init>"],
+    },
+    "rce": {
+        "java.lang.Runtime": ["exec"],
+        "java.lang.ProcessBuilder": ["<init>", "start", "command"],
+        "javax.script.ScriptEngine": ["eval"],
+        # Spring SpEL
+        "org.springframework.expression.Expression": ["getValue"],
+        "org.springframework.expression.ExpressionParser": ["parseExpression"],
+    },
+    "xxe": {
+        "org.dom4j.DocumentHelper": ["parseText"],
+        "org.dom4j.io.SAXReader": ["read"],
+        "javax.xml.parsers.DocumentBuilder": ["parse"],
+        "javax.xml.parsers.DocumentBuilderFactory": ["newDocumentBuilder"],
+        "javax.xml.stream.XMLInputFactory": ["createXMLStreamReader", "createXMLEventReader"],
+        "javax.xml.parsers.SAXParser": ["parse"],
+        "org.jdom2.input.SAXBuilder": ["build"],
+        "org.jdom.input.SAXBuilder": ["build"],
+        "javax.xml.transform.Transformer": ["transform"],
+        "javax.xml.xpath.XPathExpression": ["evaluate"],
+        "javax.xml.bind.Unmarshaller": ["unmarshal"],
+        "org.xml.sax.XMLReader": ["parse"],
+        "org.apache.commons.digester.Digester": ["parse", "asyncParse"],
+        "org.apache.commons.digester3.Digester": ["parse", "asyncParse"],
+        "javax.xml.validation.Validator": ["validate"],
+        "javax.xml.validation.SchemaFactory": ["newSchema"],
+        "org.apache.poi.xssf.extractor.XSSFExportToXml": ["exportToXML"],
+        "java.beans.XMLDecoder": ["readObject"],
+    },
+    "ssrf": {
+        "java.net.URL": ["openConnection", "openStream"],
+        "java.net.HttpURLConnection": ["connect", "getInputStream"],
+        "org.apache.http.client.HttpClient": ["execute"],
+        "org.apache.http.impl.client.CloseableHttpClient": ["execute"],
+        "org.springframework.web.client.RestTemplate": ["getForObject", "postForObject",
+                                                         "exchange", "getForEntity", "postForEntity"],
+        "org.springframework.web.reactive.function.client.WebClient": ["get", "post", "put", "delete"],
+        "okhttp3.OkHttpClient": ["newCall"],
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Sink grep patterns for pre-scanning (zero LLM cost)
+# Derived from STRUCTURED_SINKS — kept for backward compatibility and
+# fast codebase scanning.
 # ---------------------------------------------------------------------------
 
 SINK_GREP_PATTERNS = {
@@ -278,6 +430,12 @@ files, it is more likely to contain a real vulnerability.
 
 {ssrf_sinks}
 
+## Structured Sink Definitions (ClassName#method format)
+These are the authoritative sink definitions. A function call is a sink if \
+it matches one of these patterns (the class can be a superclass or interface):
+
+{structured_sinks_text}
+
 ## Analysis Methodology
 
 You MUST follow this systematic approach, which mirrors Pecker's \
@@ -318,13 +476,17 @@ Process each method from your work queue. For each method, perform TWO tasks:
 **Task A — Sink Check ("first_sink_chat" equivalent):**
 1. Read the method's source code (with imports, fields, and class context)
 2. Pre-filter: does this method contain ANY calls to known sink functions \
-listed in the sink patterns above? If not, skip to Task B.
+listed in the sink patterns above OR in the structured sink definitions? \
+Match against the ClassName#method patterns. If not, skip to Task B.
 3. If potential sinks exist, determine:
    - What type of vulnerability? (SQLI / RCE / XXE / SSRF)
    - Which specific function call is the sink?
    - What data flows into the sink? Is it user-controlled?
    - Confidence score (0-10)
-4. If confidence > 0 and a real sink is found, record it as a candidate \
+4. **Confidence threshold**: Only proceed to multi-judge verification if \
+confidence_score >= 5. If confidence is 1-4, note it but do NOT count as \
+a confirmed finding. If confidence is 0, skip entirely.
+5. If confidence >= 5 and a real sink is found, record it as a candidate \
 finding and proceed to Phase 3 (Multi-Judge Verification) for this finding.
 
 **Task B — Next-Call Expansion ("second_vulnerability_chat" equivalent):**
@@ -332,13 +494,15 @@ Regardless of whether a sink was found, analyse the current method for \
 interesting sub-function calls worth tracing deeper:
 1. Identify calls to project-internal methods (not stdlib/framework methods)
 2. For each interesting callee:
-   a. Use `grep_content` to find the callee's definition in the codebase
+   a. Use `find_definition` or `grep_content` to find the callee's definition
    b. Use `read_file` to read its source code
    c. Add it to your work queue for further analysis
-3. Continue tracing into sub-functions up to **6 levels deep** from the \
-original entry point handler
+3. Continue tracing into sub-functions up to **8 levels deep** from the \
+original entry point handler (Pecker uses max_depth=14, we use 8 for \
+LLM efficiency). **Exception**: when jumping into MyBatis XML mapper files, \
+count as depth+2 instead of depth+1 (XML lookups are more expensive).
 4. **Duplicate detection**: Do NOT re-analyse a method you have already \
-analysed in the current call chain (track by file + method name)
+analysed in the current call chain (track by file path + method signature)
 
 **Priority guidance for next-call expansion:**
 - Prioritise methods that receive string/object parameters from the parent
@@ -350,14 +514,28 @@ constructs SQL, executes commands, parses XML, or makes HTTP requests
 ### Phase 3: Multi-Judge Verification
 
 For each potential vulnerability found in Phase 2, apply ALL relevant \
-checks in order. This is an early-termination pipeline — if ANY check \
-returns True (safe), STOP and discard the finding as a false positive.
+checks **in the specified order**. This is an early-termination pipeline — \
+if ANY check returns True (safe), STOP immediately and discard the finding.
 
-**For SQLI vulnerabilities (Java):**
+**IMPORTANT — MyBatis XML pre-processing:**
+Before running multi-judge checks on MyBatis XML sinks, mentally replace \
+ALL #{{...}} (parameterized, safe) with the literal string 'constant'. \
+This helps you focus on ${{...}} (interpolated, unsafe) patterns which are \
+the actual attack surface. Do NOT confuse #{{}} with ${{}} — they are \
+fundamentally different.
+
+**For Java SQLI vulnerabilities (6 checks — Pecker's exact order):**
 1. sink_check: {sqli_sink_check}
-2. input_check: {sqli_input_check}
-3. sanitizer_check: {sqli_sanitizer_check}
-4. taint_check: {sqli_taint_check}
+2. xml_taint_num_check: {sqli_xml_taint_num_check}
+3. sink_taint_fixed_check: {sqli_sink_taint_fixed_check}
+4. sink_taint_exist_check: {sqli_sink_taint_exist_check}
+5. sanitizer_check: {sqli_sanitizer_check}
+6. taint_check: {sqli_taint_check}
+
+**For Go/Python SQLI vulnerabilities (add function_check first):**
+1. function_check: Check if the code uses a safe ORM framework that \
+automatically parameterizes queries. If yes, return True (safe).
+2-6. Then run the same checks as Java SQLI (sink_check through taint_check).
 
 **For RCE vulnerabilities:**
 1. sink_check: {rce_sink_check}
@@ -367,8 +545,8 @@ returns True (safe), STOP and discard the finding as a false positive.
 
 **For XXE vulnerabilities:**
 1. sink_check: {xxe_sink_check}
-2. feature_check: {xxe_feature_check}
-3. input_check: {xxe_input_check}
+2. input_check: {xxe_input_check}
+3. feature_check: {xxe_feature_check}
 4. taint_check: {xxe_taint_check}
 
 **For SSRF vulnerabilities:**
@@ -380,18 +558,22 @@ returns True (safe), STOP and discard the finding as a false positive.
 A finding is CONFIRMED only if ALL checks return False (unsafe). If ANY \
 check returns True (safe), the finding is a false positive — discard it.
 
-### Phase 4: Backward Taint Verification for XML/MyBatis Sinks (Optional)
+### Phase 4: Backward Taint Verification for XML/MyBatis Sinks
 
 If a confirmed finding involves a MyBatis XML mapper with `${{...}}` \
-interpolation (dynamic SQL):
+interpolation (dynamic SQL), perform backward verification:
+
 1. Extract the taint variables from the `${{...}}` patterns in the XML
 2. Map each taint variable back to the mapper interface method's parameters
 3. Walk BACKWARD through the accumulated call chain to verify that user \
 input actually reaches the taint variable at each hop:
-   - Check parameter types: numeric types (int, long, Integer, Long, etc.) \
-cannot carry injection payloads → mark as safe
-   - Check for type sensitivity: Map (key-sensitive), class (field-sensitive), \
-List (index-sensitive) — the specific key/field/index must match
+   - Check parameter types: numeric types (byte, short, int, Integer, \
+long, Long, float, double, boolean, and their List variants) CANNOT \
+carry injection payloads → mark as safe
+   - Check type sensitivity:
+     * **Map** values are key-sensitive — the specific key must match
+     * **Object/class** fields are field-sensitive — the specific field must match
+     * **List** elements are index-sensitive — the specific index must match
    - Check for sanitization at each hop
 4. If backward verification shows taint does NOT propagate → override the \
 multi-judge result and discard the finding
@@ -423,6 +605,13 @@ Each finding MUST have this structure:
     {{"method": "findByKeyword", "file": "UserDao.java", "line": 42, \
 "code": "stmt.executeQuery(\\"SELECT * FROM users WHERE name = '\\" + keyword + \\"'\\")"}}
   ],
+  "multi_judge_results": {{
+    "sink_check": false,
+    "xml_taint_num_check": false,
+    "sanitizer_check": false,
+    "taint_check": false
+  }},
+  "confidence_score": 9,
   "code_snippet": "the vulnerable code with context",
   "description": "Detailed explanation of the vulnerability, how user input \
 reaches the sink, and why existing mitigations are insufficient.",
@@ -446,19 +635,24 @@ mitigation that can be bypassed
 ### Key Analysis Principles
 1. Do NOT guess — read the actual code using read_file and grep_content
 2. FORWARD trace: start from entry-point handlers, trace into callees, \
-check each method for sinks. Do NOT start from sinks and trace backward.
+check each method for sinks. Do NOT start from sinks and trace backward \
+(except Phase 4 backward verification for MyBatis XML).
 3. At each method, always do BOTH: (a) check for sinks, (b) identify \
 sub-functions to trace next — even if no sink is found in the current method
 4. Check for sanitization at EVERY hop in the call chain
-5. For MyBatis: #{{param}} is safe (parameterized), ${{param}} is unsafe (interpolated)
-6. Numeric type parameters (int, long, Integer, Long) cannot carry string \
-injection payloads
+5. For MyBatis: #{{param}} is safe (parameterized), ${{param}} is unsafe (interpolated). \
+Before multi-judge, mentally replace all #{{}} with 'constant' to focus on ${{}}
+6. Numeric type parameters (int, long, Integer, Long, byte, short, float, \
+double, boolean) cannot carry string injection payloads
 7. Framework-level ORM methods (JPA Criteria API, MyBatis-Plus eq/ne/like) \
 are generally safe unless they accept raw SQL fragments
 8. Track the full call chain from entry point to current method — this is \
 needed for multi-judge verification and for the final finding report
-9. Respect depth limits (max 6 levels) and avoid re-analysing methods \
-already visited in the current call chain
+9. Respect depth limits (max 8 levels, +2 for MyBatis XML jumps) and avoid \
+re-analysing methods already visited in the current call chain
+10. Include multi_judge_results in each finding to show which checks were \
+applied and their results
+11. Confidence score must be >= 5 to enter multi-judge verification
 """
 
 
@@ -517,6 +711,18 @@ def _format_sink_summary(global_sinks: dict[str, str]) -> str:
     return "\n\n".join(parts)
 
 
+def _format_structured_sinks() -> str:
+    """Format STRUCTURED_SINKS into a readable text for the prompt."""
+    parts: list[str] = []
+    for category, class_methods in STRUCTURED_SINKS.items():
+        lines = [f"### {category.upper()}"]
+        for class_name, methods in class_methods.items():
+            methods_str = ", ".join(methods)
+            lines.append(f"- {class_name}#{methods_str}")
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Group agent runner
 # ---------------------------------------------------------------------------
@@ -559,21 +765,24 @@ async def _analyze_route_group(
             route_count=len(routes),
             routes_json=json.dumps(routes, indent=2),
             global_sinks_summary=_format_sink_summary(global_sinks),
+            structured_sinks_text=_format_structured_sinks(),
             sqli_sinks=SQLI_SINKS,
             rce_sinks=RCE_SINKS,
             xxe_sinks=XXE_SINKS,
             ssrf_sinks=SSRF_SINKS,
             sqli_sink_check=MULTI_JUDGE_CHECKS["sqli"]["sink_check"],
+            sqli_xml_taint_num_check=MULTI_JUDGE_CHECKS["sqli"]["xml_taint_num_check"],
+            sqli_sink_taint_fixed_check=MULTI_JUDGE_CHECKS["sqli"]["sink_taint_fixed_check"],
+            sqli_sink_taint_exist_check=MULTI_JUDGE_CHECKS["sqli"]["sink_taint_exist_check"],
             sqli_sanitizer_check=MULTI_JUDGE_CHECKS["sqli"]["sanitizer_check"],
-            sqli_input_check=MULTI_JUDGE_CHECKS["sqli"]["input_check"],
             sqli_taint_check=MULTI_JUDGE_CHECKS["sqli"]["taint_check"],
             rce_sink_check=MULTI_JUDGE_CHECKS["rce"]["sink_check"],
             rce_input_check=MULTI_JUDGE_CHECKS["rce"]["input_check"],
             rce_sanitizer_check=MULTI_JUDGE_CHECKS["rce"]["sanitizer_check"],
             rce_taint_check=MULTI_JUDGE_CHECKS["rce"]["taint_check"],
             xxe_sink_check=MULTI_JUDGE_CHECKS["xxe"]["sink_check"],
-            xxe_feature_check=MULTI_JUDGE_CHECKS["xxe"]["feature_check"],
             xxe_input_check=MULTI_JUDGE_CHECKS["xxe"]["input_check"],
+            xxe_feature_check=MULTI_JUDGE_CHECKS["xxe"]["feature_check"],
             xxe_taint_check=MULTI_JUDGE_CHECKS["xxe"]["taint_check"],
             ssrf_sink_check=MULTI_JUDGE_CHECKS["ssrf"]["sink_check"],
             ssrf_input_check=MULTI_JUDGE_CHECKS["ssrf"]["input_check"],
@@ -596,9 +805,11 @@ async def _analyze_route_group(
             f"Perform forward-tracing taint analysis on your assigned group "
             f"of {len(routes)} routes in the project at {config.project_path}. "
             f"Start from each route handler, trace forward into sub-functions "
-            f"(up to 6 levels deep), check each method for SQLI/RCE/XXE/SSRF "
-            f"sinks, and verify each finding with multi-judge checks. "
-            f"Report only confirmed vulnerabilities. "
+            f"(up to 8 levels deep), check each method for SQLI/RCE/XXE/SSRF "
+            f"sinks, and verify each finding with the full multi-judge check "
+            f"pipeline (6 checks for Java SQLI, 4 checks for other types). "
+            f"Include multi_judge_results and confidence_score in each finding. "
+            f"Report only confirmed vulnerabilities (ALL checks return False). "
             f"If you find NO vulnerabilities, submit {{\"findings\": []}}."
         )
 
@@ -633,11 +844,14 @@ def _extract_findings(result: dict) -> list[dict]:
 def _merge_findings(group_results: list[dict | BaseException]) -> list[dict]:
     """Merge and deduplicate findings from all route groups.
 
-    Deduplication is based on (file_path, line_number, type) to avoid
-    reporting the same vulnerability from overlapping call chains.
+    Deduplication uses two keys to catch duplicates:
+    1. (file_path, line_number, type) — same sink location
+    2. (sink_method, type) — same sink function name across files
+       (e.g., different call chains reaching the same DAO method)
     """
     all_findings: list[dict] = []
-    seen: set[tuple] = set()
+    seen_location: set[tuple] = set()
+    seen_sink: set[tuple] = set()
 
     for result in group_results:
         if isinstance(result, BaseException):
@@ -647,16 +861,28 @@ def _merge_findings(group_results: list[dict | BaseException]) -> list[dict]:
             continue
 
         for finding in result.get("findings", []):
-            # Dedup key: (file, line, type)
-            key = (
+            # Dedup key 1: (file, line, type) — exact location
+            loc_key = (
                 finding.get("file_path", ""),
                 finding.get("line_number", 0),
                 finding.get("type", ""),
             )
-            if key in seen:
-                logger.debug("[taint_analyzer] dedup: %s", key)
+            if loc_key in seen_location:
+                logger.debug("[taint_analyzer] dedup (location): %s", loc_key)
                 continue
-            seen.add(key)
+
+            # Dedup key 2: (sink description, type) — same logical sink
+            sink_key = (
+                finding.get("sink", ""),
+                finding.get("type", ""),
+            )
+            if sink_key and sink_key in seen_sink:
+                logger.debug("[taint_analyzer] dedup (sink): %s", sink_key)
+                continue
+
+            seen_location.add(loc_key)
+            if sink_key[0]:  # only track non-empty sinks
+                seen_sink.add(sink_key)
             all_findings.append(finding)
 
     # Re-number IDs sequentially
