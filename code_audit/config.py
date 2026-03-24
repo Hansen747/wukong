@@ -56,6 +56,15 @@ class AuditConfig(BaseModel):
     # LSP server command (only used when resolver="lsp")
     lsp_cmd: Optional[str] = None
 
+    # --- Agent selection (Layer 1 filtering) ---
+
+    # Whitelist: only run these Layer 1 agents (comma-separated names)
+    # If empty, all Layer 1 agents run.
+    agents: Optional[str] = None
+
+    # Blacklist: exclude these Layer 1 agents (comma-separated names)
+    exclude_agents: Optional[str] = None
+
     def model_post_init(self, __context):
         """
         Post-init hook:

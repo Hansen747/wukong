@@ -52,20 +52,77 @@ def _import_agents() -> None:
 # ------------------------------------------------------------------
 
 def build_dag(config: AuditConfig) -> list[Stage]:
-    """Query the agent registry and build Stage objects for the DAG."""
+    """Query the agent registry and build Stage objects for the DAG.
+
+    Applies ``--agents`` / ``--exclude-agents`` filters to Layer 1 agents.
+    Infrastructure agents (Layer 0, 2, 3) always run.  Downstream
+    ``depends_on`` lists are pruned so the DAG remains valid.
+    """
+    # Parse whitelist / blacklist
+    include_set: set[str] | None = None
+    exclude_set: set[str] = set()
+
+    if config.agents:
+        include_set = {
+            name.strip()
+            for name in config.agents.split(",")
+            if name.strip()
+        }
+    if config.exclude_agents:
+        exclude_set = {
+            name.strip()
+            for name in config.exclude_agents.split(",")
+            if name.strip()
+        }
+
+    if include_set and exclude_set:
+        logger.warning(
+            "--agents and --exclude-agents both specified; "
+            "--agents takes precedence"
+        )
+        exclude_set = set()
+
+    # Determine which agents to keep
+    all_metas = agent_registry.all()
+    kept_names: set[str] = set()
+    skipped_names: set[str] = set()
+
+    for meta in all_metas:
+        if meta.layer == 1:
+            # Apply include/exclude filters only to Layer 1
+            if include_set is not None and meta.name not in include_set:
+                skipped_names.add(meta.name)
+                continue
+            if meta.name in exclude_set:
+                skipped_names.add(meta.name)
+                continue
+        kept_names.add(meta.name)
+
+    if skipped_names:
+        logger.info(
+            "Filtered out Layer 1 agents: %s",
+            ", ".join(sorted(skipped_names)),
+        )
+
     stages: list[Stage] = []
 
-    for meta in agent_registry.all():
+    for meta in all_metas:
+        if meta.name not in kept_names:
+            continue
+
         # Use agent-level timeout if set, else fall back to config-level
         timeout = meta.timeout
         if config.agent_timeout > 0:
             timeout = config.agent_timeout
 
+        # Prune depends_on: remove references to filtered-out agents
+        depends_on = [d for d in meta.depends_on if d in kept_names]
+
         stages.append(
             Stage(
                 name=meta.name,
                 agent_factory=meta.factory,
-                depends_on=list(meta.depends_on),
+                depends_on=depends_on,
                 timeout=timeout,
             )
         )
@@ -234,6 +291,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--agents",
+        default=None,
+        help="Only run these Layer 1 agents (comma-separated). "
+             "E.g. --agents taint_analyzer,auth_auditor",
+    )
+
+    parser.add_argument(
+        "--exclude-agents",
+        default=None,
+        help="Exclude these Layer 1 agents (comma-separated). "
+             "E.g. --exclude-agents hardcoded_auditor",
+    )
+
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -286,6 +357,8 @@ def main(argv: list[str] | None = None) -> None:
         taint_max_concurrent=args.taint_max_concurrent,
         resolver=args.resolver,
         lsp_cmd=args.lsp_cmd,
+        agents=args.agents,
+        exclude_agents=args.exclude_agents,
     )
 
     # Ensure output directory exists
@@ -300,6 +373,10 @@ def main(argv: list[str] | None = None) -> None:
     logger.info("  Output:      %s", config.output_dir)
     logger.info("  Provider:    %s", config.provider)
     logger.info("  Model:       %s", config.model)
+    if config.agents:
+        logger.info("  Agents:      %s (whitelist)", config.agents)
+    if config.exclude_agents:
+        logger.info("  Exclude:     %s", config.exclude_agents)
     logger.info("=" * 60)
 
     # Import agents (triggers @register_agent decorators)

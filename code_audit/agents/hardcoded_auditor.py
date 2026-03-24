@@ -125,6 +125,14 @@ async def run_hardcoded_auditor(config: AuditConfig, inputs: dict) -> dict:
     if "findings" not in result:
         result = {"findings": result.get("data", {}).get("findings", [])}
 
+    # Persist findings to file (consistent with other Layer 1 agents)
+    findings_path = os.path.join(config.output_dir, "hardcoded-findings.json")
+    with open(findings_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {"findings": result.get("findings", [])},
+            f, indent=2, ensure_ascii=False,
+        )
+
     logger.info(
         "[hardcoded_auditor] %d findings", len(result.get("findings", []))
     )
