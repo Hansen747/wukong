@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from ..tools.registry import ToolRegistry
 
@@ -123,6 +123,7 @@ class AuditAgent:
         max_tokens: int = 16384,
         provider: str = "anthropic",
         context_window_turns: int = 0,
+        compression_summary_factory: Optional[Callable[[list[dict]], str]] = None,
     ) -> None:
         self.client = client
         self.model = model
@@ -133,6 +134,7 @@ class AuditAgent:
         self.max_tokens = max_tokens
         self.provider = provider
         self.context_window_turns = context_window_turns  # 0 = no compression
+        self.compression_summary_factory = compression_summary_factory
         self._submit_fail_count = 0
 
     # ------------------------------------------------------------------
@@ -270,40 +272,78 @@ class AuditAgent:
     # Context compression (sliding window)
     # ------------------------------------------------------------------
 
+    def _build_compression_summary(
+        self, dropped_msgs: list[dict], compressed_count: int
+    ) -> str:
+        """Build a summary string for the compressed context window.
+
+        If *compression_summary_factory* was provided at construction, delegates
+        to it (passing the about-to-be-dropped messages) so that agent-specific
+        state (visited files, candidate findings, etc.) can be preserved.
+        Falls back to a generic placeholder on any error or when no factory
+        is configured.
+        """
+        if self.compression_summary_factory is not None:
+            try:
+                return self.compression_summary_factory(dropped_msgs)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[%s] compression_summary_factory raised: %s", self.name, exc
+                )
+        return (
+            f"[Context compressed: {compressed_count} earlier messages removed. "
+            f"I will continue my analysis from where I left off, "
+            f"tracking which methods I've already analyzed to avoid "
+            f"duplicates, and submit findings when done.]"
+        )
+
+    @staticmethod
+    def _find_turn_starts_openai(messages: list[dict], start: int) -> list[int]:
+        """Return indices of each turn's first message (assistant) in OpenAI format.
+
+        A turn = one assistant message + its subsequent tool-role messages.
+        We scan from *start* to the end of *messages*.
+        """
+        turns: list[int] = []
+        for i in range(start, len(messages)):
+            if messages[i].get("role") == "assistant":
+                turns.append(i)
+        return turns
+
     def _compress_messages_openai(self, messages: list[dict]) -> list[dict]:
         """Apply sliding window compression to OpenAI-format messages.
 
         Keeps the system message (index 0), the initial user message
-        (index 1), and the last ``context_window_turns`` pairs of
-        messages. Older messages are replaced with a single summary
-        message to preserve continuity.
-
-        A "turn" is an assistant message + its tool result messages.
-        We count backwards from the end to keep the most recent turns.
+        (index 1), and the last ``context_window_turns`` complete turns.
+        A turn = one assistant message + all its subsequent tool messages.
+        Older turns are dropped and replaced with a single assistant
+        summary message to preserve role alternation.
         """
         if self.context_window_turns <= 0:
             return messages  # no compression
 
-        # Need at least: system + user + some turns to compress
-        # Each "turn" is roughly: assistant msg + 1+ tool msgs
-        # We keep system(0) + user(1) + last N*3 messages (rough heuristic)
-        keep_tail = self.context_window_turns * 3
-        if len(messages) <= 2 + keep_tail:
-            return messages  # not enough to compress
+        # Find turn boundaries (each starting with an assistant message)
+        # Messages 0=system, 1=user, then turns start from index 2
+        turn_starts = self._find_turn_starts_openai(messages, start=2)
+
+        if len(turn_starts) <= self.context_window_turns:
+            return messages  # not enough turns to compress
+
+        # Keep the last N turns; the cut point is the start of the
+        # (total - N)-th turn from the end
+        keep_from = turn_starts[-self.context_window_turns]
 
         head = messages[:2]  # system + initial user
-        tail = messages[-keep_tail:]  # recent turns
+        tail = messages[keep_from:]  # recent complete turns
 
-        # Count how many messages were compressed
-        compressed_count = len(messages) - 2 - keep_tail
+        compressed_count = keep_from - 2  # messages being dropped
+        dropped_msgs = messages[2:keep_from]
+        # Use assistant role so that head(user) -> summary(assistant) -> tail(assistant)
+        # stays valid.  The next tail message is assistant which is fine
+        # after this summary because OpenAI tolerates adjacent assistant msgs.
         summary_msg = {
-            "role": "user",
-            "content": (
-                f"[Context compressed: {compressed_count} earlier messages removed. "
-                f"Continue your analysis from where you left off. "
-                f"Remember to track which methods you've already analyzed to avoid "
-                f"duplicates, and submit findings when done.]"
-            ),
+            "role": "assistant",
+            "content": self._build_compression_summary(dropped_msgs, compressed_count),
         }
 
         compressed = head + [summary_msg] + tail
@@ -315,35 +355,75 @@ class AuditAgent:
         )
         return compressed
 
+    @staticmethod
+    def _find_turn_starts_anthropic(messages: list[dict], start: int) -> list[int]:
+        """Return indices of each turn's first message (assistant) in Anthropic format.
+
+        A turn = one assistant message + one subsequent user message
+        (which carries tool_result content).  We scan from *start*.
+        """
+        turns: list[int] = []
+        for i in range(start, len(messages)):
+            if messages[i].get("role") == "assistant":
+                turns.append(i)
+        return turns
+
     def _compress_messages_anthropic(self, messages: list[dict]) -> list[dict]:
         """Apply sliding window compression to Anthropic-format messages.
 
         Keeps the initial user message (index 0) and the last
-        ``context_window_turns`` pairs. System prompt is passed
+        ``context_window_turns`` complete turns.  System prompt is passed
         separately in Anthropic API, so it's not in the messages list.
+
+        A turn = one assistant message + one subsequent user message
+        (carrying tool_result).  The summary uses ``assistant`` role so
+        that the sequence stays: user(head) -> assistant(summary) ->
+        assistant(tail) or user(tail), both of which Anthropic accepts
+        after we ensure the tail starts at a valid turn boundary.
         """
         if self.context_window_turns <= 0:
             return messages  # no compression
 
-        keep_tail = self.context_window_turns * 3
-        if len(messages) <= 1 + keep_tail:
-            return messages
+        # Find turn boundaries starting after the initial user message
+        turn_starts = self._find_turn_starts_anthropic(messages, start=1)
+
+        if len(turn_starts) <= self.context_window_turns:
+            return messages  # not enough turns to compress
+
+        # Keep the last N turns
+        keep_from = turn_starts[-self.context_window_turns]
 
         head = messages[:1]  # initial user message
-        tail = messages[-keep_tail:]
+        tail = messages[keep_from:]  # recent complete turns
 
-        compressed_count = len(messages) - 1 - keep_tail
-        summary_msg = {
+        compressed_count = keep_from - 1  # messages being dropped
+        dropped_msgs = messages[1:keep_from]
+        # Use assistant role to maintain user/assistant alternation:
+        # head[-1] is user -> summary is assistant -> tail[0] is assistant
+        # Two adjacent assistants would violate Anthropic rules, but
+        # tail[0] is guaranteed to be assistant (that's how turn_starts
+        # works), so we must ensure we don't break alternation.
+        # Solution: the summary acts as the assistant reply to the head
+        # user message, and tail starts with assistant which then has
+        # its own user(tool_result) after it — so we need to check if
+        # tail[0] is assistant.  If so, we fold the summary into the
+        # beginning of that assistant content.  Otherwise just insert.
+        summary_text = self._build_compression_summary(dropped_msgs, compressed_count)
+
+        # tail[0] is always assistant (from turn_starts), so insert
+        # a standalone assistant summary before it to satisfy
+        # user -> assistant alternation, then merge adjacent assistants.
+        # Simplest correct approach: insert an assistant+user pair as bridge.
+        summary_assistant = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": summary_text}],
+        }
+        summary_user = {
             "role": "user",
-            "content": (
-                f"[Context compressed: {compressed_count} earlier messages removed. "
-                f"Continue your analysis from where you left off. "
-                f"Remember to track which methods you've already analyzed to avoid "
-                f"duplicates, and submit findings when done.]"
-            ),
+            "content": [{"type": "text", "text": "Understood. Please continue."}],
         }
 
-        compressed = head + [summary_msg] + tail
+        compressed = head + [summary_assistant, summary_user] + tail
         logger.debug(
             "[%s] context compressed: %d -> %d messages",
             self.name,

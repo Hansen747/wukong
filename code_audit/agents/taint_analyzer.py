@@ -657,6 +657,132 @@ applied and their results
 
 
 # ---------------------------------------------------------------------------
+# Context compression summary factory — taint-analysis-aware
+# ---------------------------------------------------------------------------
+
+def _taint_compression_summary(dropped_msgs: list[dict]) -> str:
+    """Generate a taint-analysis-aware summary of about-to-be-dropped messages.
+
+    Scans the compressed messages to extract:
+    - Files/symbols already analyzed via read_file / find_definition / etc.
+    - Candidate vulnerability types (SQLI, RCE, XXE, SSRF) mentioned alongside
+      analysis keywords (confidence, sink, finding, taint).
+
+    The result is injected as the context-bridge so the LLM knows:
+    (1) which files/methods NOT to re-analyze, and
+    (2) what tentative findings were identified before the window rolled forward.
+    """
+    visited_files: set[str] = set()
+    vuln_types_seen: set[str] = set()
+
+    _analysis_tools = {
+        "read_file", "find_definition", "extract_function_calls", "find_references",
+    }
+
+    def _extract_tool_call(block: object) -> tuple[str, dict]:
+        """Return (tool_name, input_args) from an Anthropic or OpenAI tool block."""
+        if isinstance(block, dict):
+            if block.get("type") == "tool_use":
+                return block.get("name", ""), block.get("input") or {}
+        else:
+            # Anthropic SDK model object
+            if getattr(block, "type", None) == "tool_use":
+                return getattr(block, "name", ""), getattr(block, "input", {}) or {}
+        return "", {}
+
+    def _extract_text(block: object) -> str:
+        """Return text content from a dict/SDK content block."""
+        if isinstance(block, dict):
+            return block.get("text", "") if block.get("type") == "text" else ""
+        return getattr(block, "text", "") if getattr(block, "type", None) == "text" else ""
+
+    def _record_file(fp: str) -> None:
+        if not fp:
+            return
+        basename = fp.replace("\\", "/").split("/")[-1]
+        # Accept filenames (have extension) or method signatures (have parenthesis)
+        if "." in basename or "(" in basename:
+            visited_files.add(basename)
+
+    def _scan_for_vulns(text: str) -> None:
+        tu = text.upper()
+        # Only flag when analysis-context keywords are also present
+        context_kw = {"CONFIDENCE", "SINK", "FINDING", "VULNERABILITY", "TAINT", "CONFIRMED"}
+        if not any(kw in tu for kw in context_kw):
+            return
+        for vtype, keywords in (
+            ("SQLI", {"SQLI", "SQL INJECTION"}),
+            ("RCE", {"RCE", "REMOTE CODE EXECUTION", "COMMAND INJECTION"}),
+            ("XXE", {"XXE", "XML EXTERNAL ENTITY"}),
+            ("SSRF", {"SSRF", "SERVER-SIDE REQUEST FORGERY", "SERVER SIDE REQUEST FORGERY"}),
+        ):
+            if any(kw in tu for kw in keywords):
+                vuln_types_seen.add(vtype)
+
+    for msg in dropped_msgs:
+        role = msg.get("role", "")
+        content = msg.get("content")
+
+        if role != "assistant":
+            continue
+
+        # --- OpenAI format: tool_calls is a list of plain dicts ---
+        for tc in (msg.get("tool_calls") or []):
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            fname = fn.get("name", "")
+            if fname in _analysis_tools:
+                fargs_str = fn.get("arguments", "{}")
+                try:
+                    args = json.loads(fargs_str) if isinstance(fargs_str, str) else fargs_str
+                except Exception:  # noqa: BLE001
+                    args = {}
+                _record_file(args.get("file_path") or args.get("symbol", ""))
+
+        # OpenAI text content
+        if isinstance(content, str) and content:
+            _scan_for_vulns(content)
+
+        # --- Anthropic format: content is a list of blocks (SDK objs or dicts) ---
+        if isinstance(content, list):
+            for block in content:
+                fname, args = _extract_tool_call(block)
+                if fname in _analysis_tools:
+                    _record_file(args.get("file_path") or args.get("symbol", ""))
+                text = _extract_text(block)
+                if text:
+                    _scan_for_vulns(text)
+
+    # Build summary string
+    n = len(dropped_msgs)
+    parts: list[str] = [f"[Context compressed: {n} earlier messages removed."]
+
+    if visited_files:
+        preview = sorted(visited_files)[:20]
+        extra = len(visited_files) - len(preview)
+        files_str = ", ".join(preview)
+        if extra > 0:
+            files_str += f" (+{extra} more)"
+        parts.append(f" Already-analyzed files: {files_str}.")
+
+    if vuln_types_seen:
+        parts.append(
+            f" Tentative vulnerability types identified: {', '.join(sorted(vuln_types_seen))}."
+        )
+
+    parts.append(
+        " Continue forward-tracing taint analysis on remaining unvisited routes/methods."
+        " Do NOT re-read or re-analyze files already listed above."
+        " Maintain call-depth counter (max 8 hops from entry point; +2 for MyBatis XML)."
+        " Apply full multi-judge pipeline (all checks must return False) before confirming."
+        " Track visited method signatures to avoid duplicate work.]"
+    )
+
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Pre-scan: grep for global sink locations (zero LLM cost)
 # ---------------------------------------------------------------------------
 
@@ -799,6 +925,7 @@ async def _analyze_route_group(
             max_turns=config.agent_max_turns or 80,
             provider=config.provider,
             context_window_turns=20,  # sliding window: keep last 20 turns
+            compression_summary_factory=_taint_compression_summary,
         )
 
         result = await agent.run(
