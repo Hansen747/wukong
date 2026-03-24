@@ -43,12 +43,12 @@ Wukong 是一个基于 DAG（有向无环图）调度的代码安全审计工具
 ```
 Layer 0:  route_mapper                         (提取 HTTP 路由)
               │
-              ├─────────────┬──────────────┬─────────────────────┐
-              ▼             ▼              ▼                     ▼
-Layer 1:  auth_auditor  taint_analyzer  hardcoded_auditor  path_traversal_auditor
-          (认证审计)    (污点分析)       (硬编码检测)        (路径穿越检测)
-              │             │              │                     │
-              └─────────────┼──────────────┼─────────────────────┘
+              ├─────────────┬──────────────┐
+              ▼             ▼              ▼
+Layer 1:  auth_auditor  taint_analyzer  hardcoded_auditor
+          (认证审计)    (污点分析)       (硬编码检测)
+              │             │              │
+              └─────────────┼──────────────┘
                             ▼
 Layer 2:              vuln_verifier                  (独立验证)
                             │
@@ -90,8 +90,7 @@ wukong/
 │       ├── route_mapper.py       # Layer 0: HTTP 路由提取
 │       ├── auth_auditor.py       # Layer 1: 认证/授权漏洞审计
 │       ├── hardcoded_auditor.py  # Layer 1: 硬编码密钥/凭据检测
-│       ├── path_traversal_auditor.py  # Layer 1: 路径穿越漏洞检测
-│       ├── taint_analyzer.py     # Layer 1: 协调器 + 路由分组并行污点分析
+│       ├── taint_analyzer.py     # Layer 1: 协调器 + 路由分组并行污点分析 (SQLI/RCE/XXE/SSRF/Path Traversal)
 │       ├── vuln_verifier.py      # Layer 2: 独立源码验证
 │       └── report_generator.py   # Layer 3: Markdown/JSON 报告生成
 ```
@@ -124,13 +123,13 @@ wukong/
 
 ```python
 @register_agent(
-    name="path_traversal_auditor",
+    name="auth_auditor",
     layer=1,
     depends_on=["route_mapper"],
     timeout=1800,
-    description="Find path traversal vulnerabilities (CWE-22)",
+    description="Detect authentication and authorization vulnerabilities",
 )
-async def run_path_traversal_auditor(config: AuditConfig, inputs: dict) -> dict:
+async def run_auth_auditor(config: AuditConfig, inputs: dict) -> dict:
     ...
 ```
 
@@ -241,19 +240,9 @@ async def run_path_traversal_auditor(config: AuditConfig, inputs: dict) -> dict:
 - 区分真实凭据与占位符
 - 输出: `{"findings": [Finding...]}`
 
-### path_traversal_auditor (Layer 1)
-
-检测路径穿越 / 目录遍历漏洞 (CWE-22/CWE-23)。
-
-- 搜索 7 类危险 Sink：File 构造器、NIO 操作、静态文件服务、路径操作、Servlet 文件访问、URL 解码、已有防御
-- 逆向追踪 Source（HTTP 请求参数、URI 路径、请求头等）到 Sink 的数据流
-- 评估缓解措施的有效性（路径规范化 + 边界检查、白名单、编码处理）
-- 检查框架版本的已知 CVE（如 CVE-2018-9159）
-- 输出: `{"findings": [Finding...]}`
-
 ### taint_analyzer (Layer 1)
 
-LLM 驱动的原生污点分析，覆盖 SQLI / RCE / XXE / SSRF 四类漏洞。
+LLM 驱动的原生污点分析，覆盖 SQLI / RCE / XXE / SSRF / Path Traversal 五类漏洞。
 
 此 Agent 取代了之前基于子进程调用的 Pecker 扫描器，将污点分析逻辑以原生 LLM Agent 形式重新实现。核心方法论来自 Pecker 的 **正向追踪（Source→Sink）生产者/消费者** 架构。
 
@@ -265,7 +254,7 @@ taint_analyzer 采用 **协调器 + 分组并行** 模式，无需额外 LLM 调
 taint_analyzer (协调器, 非 LLM)
         │
         ├── Step 1: Pre-scan (grep, 零 LLM 成本)
-        │   └── 在代码库中搜索 4 类 Sink 模式 (SQLI/RCE/XXE/SSRF)
+        │   └── 在代码库中搜索 5 类 Sink 模式 (SQLI/RCE/XXE/SSRF/Path Traversal)
         │       并记录文件位置，作为优先级参考
         │
         ├── Step 2: 路由分组 (taint_group_size=10)
@@ -288,7 +277,7 @@ taint_analyzer (协调器, 非 LLM)
 
 每个分组 Agent 是一个独立的 `AuditAgent` 会话，具备：
 - 完整的方法论提示词（5 阶段分析流程）
-- 自己的 Sink 模式库（54+ SQL、6+ RCE、51+ XXE、SSRF）
+- 自己的 Sink 模式库（54+ SQL、6+ RCE、51+ XXE、SSRF、20+ Path Traversal）
 - 自己分配的路由子集 + 预扫描的 Sink 位置
 - CodeResolver 工具（find_definition、find_references 等）
 - 滑动窗口上下文压缩（`context_window_turns=20`）
@@ -309,10 +298,11 @@ taint_analyzer (协调器, 非 LLM)
 
 3. **Phase 3 — Multi-Judge 多维验证**
    - 对每个潜在漏洞执行多维度判定（借鉴 Pecker 的 multi-judge chain，早期终止）：
-     - **SQLI**: sink_check → input_check → sanitizer_check → taint_check
-     - **RCE**: sink_check → input_check → sanitizer_check → taint_check
-     - **XXE**: sink_check → feature_check → input_check → taint_check
-     - **SSRF**: sink_check → input_check → sanitizer_check → taint_check
+      - **SQLI**: sink_check → input_check → sanitizer_check → taint_check
+      - **RCE**: sink_check → input_check → sanitizer_check → taint_check
+      - **XXE**: sink_check → feature_check → input_check → taint_check
+      - **SSRF**: sink_check → input_check → sanitizer_check → taint_check
+      - **Path Traversal**: sink_check → input_check → canonicalization_check → sanitizer_check → taint_check
    - 任意一个 check 返回 True（安全），则判定为误报并丢弃
 
 4. **Phase 4 — XML/MyBatis 逆向污点验证（可选）**
@@ -329,7 +319,7 @@ taint_analyzer (协调器, 非 LLM)
 
 独立验证上游所有 Agent 的发现。
 
-- 合并上游 4 个 Agent（auth_auditor、taint_analyzer、hardcoded_auditor、path_traversal_auditor）的 findings
+- 合并上游 3 个 Agent（auth_auditor、taint_analyzer、hardcoded_auditor）的 findings
 - 按严重性排序，最多验证 30 条
 - 对每条 finding 执行 5 步验证：确认 Source、确认 Sink、追踪数据流、检查净化措施、分配状态
 - 不信任上游声明，独立阅读源码验证
@@ -457,21 +447,20 @@ python -m code_audit ../project_for_detect/spark \
 
 ### 执行过程
 
-Pipeline 共 7 个 Stage，按 DAG 拓扑序执行。taint_analyzer 自动将 57 条路由拆分为 6 组并行分析：
+Pipeline 共 6 个 Stage，按 DAG 拓扑序执行。taint_analyzer 自动将 57 条路由拆分为 6 组并行分析：
 
 ```
 00:18:28 [INFO] Wukong (悟空) Code Audit
 00:18:28 [INFO] Project:  .../project_for_detect/spark
 00:18:28 [INFO] Provider: openai (qwen-plus via 阿里云百炼)
-00:18:28 [INFO] Starting pipeline with 7 stages
+00:18:28 [INFO] Starting pipeline with 6 stages
 
 00:18:28 [STAGE] route_mapper              >>> RUNNING
 00:24:16 [STAGE] route_mapper              >>> SUCCESS      (57 routes)
 
 00:24:16 [STAGE] auth_auditor              >>> RUNNING  ─┐
-00:24:16 [STAGE] taint_analyzer            >>> RUNNING   │
-00:24:16 [STAGE] hardcoded_auditor         >>> RUNNING   ├─ 并行执行 (Layer 1)
-00:24:16 [STAGE] path_traversal_auditor    >>> RUNNING  ─┘
+00:24:16 [STAGE] taint_analyzer            >>> RUNNING   ├─ 并行执行 (Layer 1)
+00:24:16 [STAGE] hardcoded_auditor         >>> RUNNING  ─┘
 
 00:24:16 [taint_analyzer] split into 6 groups (size=10, max_concurrent=3)
 00:24:16 [taint_analyzer] group 1 starting — 10 routes  ─┐
@@ -482,7 +471,6 @@ Pipeline 共 7 个 Stage，按 DAG 拓扑序执行。taint_analyzer 自动将 57
 00:25:44 [STAGE] hardcoded_auditor         >>> SUCCESS      (4 findings)
 00:26:58 [taint_analyzer] group 5 starting — 10 routes
 00:27:03 [taint_analyzer] group 6 starting — 7 routes
-00:30:18 [STAGE] path_traversal_auditor    >>> SUCCESS
 00:31:03 [STAGE] taint_analyzer            >>> SUCCESS      (0 findings)
 
 00:31:03 [STAGE] vuln_verifier             >>> RUNNING
@@ -491,7 +479,7 @@ Pipeline 共 7 个 Stage，按 DAG 拓扑序执行。taint_analyzer 自动将 57
 00:31:40 [STAGE] report_generator          >>> RUNNING
 00:31:40 [STAGE] report_generator          >>> SUCCESS
 
-00:31:40 [INFO] Pipeline finished in ~793s — 7 success, 0 failed, 0 skipped
+00:31:40 [INFO] Pipeline finished in ~793s — 6 success, 0 failed, 0 skipped
 ```
 
 > taint_analyzer 对 SparkJava 返回 0 findings 是正确的 — SparkJava 本身是一个 Web 框架库，不包含 SQL/RCE/XXE/SSRF 的应用层 Sink。taint_analyzer 的价值在于扫描使用数据库、命令执行或 XML 解析的应用代码时。
