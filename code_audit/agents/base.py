@@ -16,6 +16,7 @@ import logging
 import re
 from typing import Any, Callable, Optional
 
+from ..prompts.base import COMPRESSION_BRIDGE_USER_MESSAGE, COMPRESSION_FALLBACK_TEMPLATE
 from ..tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -290,12 +291,7 @@ class AuditAgent:
                 logger.debug(
                     "[%s] compression_summary_factory raised: %s", self.name, exc
                 )
-        return (
-            f"[Context compressed: {compressed_count} earlier messages removed. "
-            f"I will continue my analysis from where I left off, "
-            f"tracking which methods I've already analyzed to avoid "
-            f"duplicates, and submit findings when done.]"
-        )
+        return COMPRESSION_FALLBACK_TEMPLATE.format(compressed_count=compressed_count)
 
     @staticmethod
     def _find_turn_starts_openai(messages: list[dict], start: int) -> list[int]:
@@ -420,7 +416,7 @@ class AuditAgent:
         }
         summary_user = {
             "role": "user",
-            "content": [{"type": "text", "text": "Understood. Please continue."}],
+            "content": [{"type": "text", "text": COMPRESSION_BRIDGE_USER_MESSAGE}],
         }
 
         compressed = head + [summary_assistant, summary_user] + tail
