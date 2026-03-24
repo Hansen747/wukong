@@ -1,4 +1,4 @@
-"""Taint analyzer agent — LLM-driven taint analysis for SQLI, RCE, XXE, SSRF.
+"""Taint analyzer agent — LLM-driven taint analysis for SQLI, RCE, XXE, SSRF, Path Traversal.
 
 Re-implements the core taint analysis approach from Pecker as a native
 LLM agent within the wukong framework.  Instead of invoking Pecker as an
@@ -108,6 +108,45 @@ SSRF_SINKS = """
 - WebClient: get, post, put, delete
 - OkHttp: newCall
 - Any HTTP client where the URL is constructed from user input
+"""
+
+PATH_TRAVERSAL_SINKS = """
+## Path Traversal / Directory Traversal Sinks (CWE-22, CWE-23, CWE-36)
+
+### File I/O constructors & operations
+- java.io.File: <init>, exists, delete, listFiles, list, mkdir, mkdirs, renameTo
+- java.io.FileInputStream: <init>
+- java.io.FileOutputStream: <init>
+- java.io.FileReader: <init>
+- java.io.FileWriter: <init>
+- java.io.RandomAccessFile: <init>
+
+### NIO Path & Files operations
+- java.nio.file.Paths: get
+- java.nio.file.Path: of, resolve, resolveSibling
+- java.nio.file.Files: readAllBytes, readAllLines, readString, write, copy, move, \
+delete, deleteIfExists, exists, newInputStream, newOutputStream, \
+newBufferedReader, newBufferedWriter, lines, walk, list, createFile, \
+createDirectory, createDirectories
+
+### Servlet / Spring resource access
+- javax.servlet.ServletContext: getRealPath, getResource, getResourceAsStream
+- jakarta.servlet.ServletContext: getRealPath, getResource, getResourceAsStream
+- org.springframework.core.io.ClassPathResource: <init>
+- org.springframework.core.io.FileSystemResource: <init>
+- org.springframework.core.io.UrlResource: <init>
+- org.springframework.core.io.ResourceLoader: getResource
+- org.springframework.util.ResourceUtils: getFile, getURL
+
+### Static file serving (framework-level)
+- spark.Spark: staticFiles, staticFileLocation, externalStaticFileLocation
+- spark.staticfiles.StaticFilesConfiguration: consume, getContent
+- org.springframework.web.servlet.resource.ResourceHttpRequestHandler: handleRequest
+
+### Archive / Zip operations (Zip Slip — CWE-22 variant)
+- java.util.zip.ZipInputStream: getNextEntry
+- java.util.zip.ZipFile: getInputStream, entries
+- org.apache.commons.compress.archivers.ArchiveInputStream: getNextEntry
 """
 
 # ---------------------------------------------------------------------------
@@ -260,6 +299,62 @@ MULTI_JUDGE_CHECKS = {
             "reach the URL construction? Return True if not, False if yes."
         ),
     },
+    "path_traversal": {
+        # Path traversal check order:
+        # sink_check -> input_check -> canonicalization_check -> sanitizer_check -> taint_check
+        "sink_check": (
+            "Check if the code performs file system operations using: "
+            "new File(), FileInputStream, FileOutputStream, FileReader, FileWriter, "
+            "RandomAccessFile, Paths.get(), Path.of(), Files.read*/write*/copy/move/delete, "
+            "ServletContext.getRealPath(), ClassPathResource, FileSystemResource, "
+            "ResourceLoader.getResource(), or static file serving handlers. "
+            "Also check for Zip/archive extraction operations (ZipInputStream, ZipFile). "
+            "If such functions are called, return False (dangerous sink exists). "
+            "Otherwise return True (no file system sink)."
+        ),
+        "input_check": (
+            "Determine if the file path used in the file system operation comes "
+            "from user input. Check for: HTTP request parameters, URL path components "
+            "(request.getPathInfo(), getServletPath(), getRequestURI(), request.pathInfo(), "
+            "request.params(), request.splat()), uploaded file names (getSubmittedFileName()), "
+            "HTTP headers, or any other user-controlled string. "
+            "If the file path is entirely hardcoded or from trusted config, return True (safe). "
+            "If user can influence ANY part of the file path, return False."
+        ),
+        "canonicalization_check": (
+            "Check if the code properly canonicalizes the path AND validates the result: "
+            "1. Path canonicalization: getCanonicalPath(), toRealPath(), normalize() "
+            "2. Followed by a bounds check: canonicalPath.startsWith(baseDir) or equivalent. "
+            "BOTH steps are required — canonicalization alone is NOT sufficient. "
+            "Also check for: "
+            "- Null byte rejection (\\x00) "
+            "- URL-encoded traversal detection (%2e%2e, %2f, %252e%252e — double encoding) "
+            "- chroot / sandbox / jail directory enforcement "
+            "Return True if proper canonicalization + bounds checking exists (safe). "
+            "Return False if missing or incomplete (e.g., only checks for '..' literal "
+            "but not URL-encoded variants, or canonicalizes but doesn't verify bounds)."
+        ),
+        "sanitizer_check": (
+            "Check if there is path sanitization that effectively prevents traversal: "
+            "- Whitelist validation: comparing against a fixed set of allowed filenames/paths "
+            "- Strict regex that rejects any path containing '..' in any encoding "
+            "- Path component validation (no '/' or '\\' in user-supplied filename) "
+            "- Framework-level path security (e.g., Spring Security resource handler "
+            "  with proper configuration) "
+            "A blacklist that only checks for '..' literal but not %2e%2e/%252e%252e "
+            "is INEFFECTIVE — return False. "
+            "Return True if effective sanitization exists, False otherwise."
+        ),
+        "taint_check": (
+            "Trace user input flow: does any user-controlled input reach the file "
+            "path construction? Consider direct concatenation (baseDir + userInput), "
+            "Path.resolve(userInput), String.format with user input, and indirect "
+            "flows through method calls. "
+            "Also consider framework-level path resolution where the framework "
+            "resolves requested URLs to file system paths (e.g., static file serving). "
+            "Return True if taint does NOT reach the file path sink, False if it does."
+        ),
+    },
 }
 
 # Check orders per language/vuln type (matches Pecker exactly)
@@ -270,15 +365,21 @@ MULTI_JUDGE_CHECK_ORDERS = {
         "rce": ["sink_check", "input_check", "sanitizer_check", "taint_check"],
         "xxe": ["sink_check", "input_check", "feature_check", "taint_check"],
         "ssrf": ["sink_check", "input_check", "sanitizer_check", "taint_check"],
+        "path_traversal": ["sink_check", "input_check", "canonicalization_check",
+                           "sanitizer_check", "taint_check"],
     },
     "go": {
         "sqli": ["function_check", "sink_check", "input_check", "sanitizer_check", "taint_check"],
         "rce": ["sink_check", "input_check", "sanitizer_check", "taint_check"],
+        "path_traversal": ["sink_check", "input_check", "canonicalization_check",
+                           "sanitizer_check", "taint_check"],
     },
     "python": {
         "sqli": ["function_check", "sink_check", "input_check", "sanitizer_check", "taint_check"],
         "rce": ["sink_check", "input_check", "sanitizer_check", "taint_check"],
         "xxe": ["sink_check", "input_check", "feature_check", "taint_check"],
+        "path_traversal": ["sink_check", "input_check", "canonicalization_check",
+                           "sanitizer_check", "taint_check"],
     },
 }
 
@@ -375,6 +476,38 @@ STRUCTURED_SINKS = {
         "org.springframework.web.reactive.function.client.WebClient": ["get", "post", "put", "delete"],
         "okhttp3.OkHttpClient": ["newCall"],
     },
+    "path_traversal": {
+        # File I/O constructors
+        "java.io.File": ["<init>"],
+        "java.io.FileInputStream": ["<init>"],
+        "java.io.FileOutputStream": ["<init>"],
+        "java.io.FileReader": ["<init>"],
+        "java.io.FileWriter": ["<init>"],
+        "java.io.RandomAccessFile": ["<init>"],
+        # NIO
+        "java.nio.file.Paths": ["get"],
+        "java.nio.file.Path": ["of", "resolve", "resolveSibling"],
+        "java.nio.file.Files": ["readAllBytes", "readAllLines", "readString", "write",
+                                "copy", "move", "delete", "deleteIfExists", "exists",
+                                "newInputStream", "newOutputStream", "newBufferedReader",
+                                "newBufferedWriter", "lines", "walk", "list",
+                                "createFile", "createDirectory", "createDirectories"],
+        # Servlet
+        "javax.servlet.ServletContext": ["getRealPath", "getResource", "getResourceAsStream"],
+        "jakarta.servlet.ServletContext": ["getRealPath", "getResource", "getResourceAsStream"],
+        # Spring resource
+        "org.springframework.core.io.ClassPathResource": ["<init>"],
+        "org.springframework.core.io.FileSystemResource": ["<init>"],
+        "org.springframework.core.io.UrlResource": ["<init>"],
+        "org.springframework.core.io.ResourceLoader": ["getResource"],
+        "org.springframework.util.ResourceUtils": ["getFile", "getURL"],
+        # Static file serving
+        "spark.staticfiles.StaticFilesConfiguration": ["consume"],
+        "org.springframework.web.servlet.resource.ResourceHttpRequestHandler": ["handleRequest"],
+        # Zip/archive (Zip Slip)
+        "java.util.zip.ZipInputStream": ["getNextEntry"],
+        "java.util.zip.ZipFile": ["getInputStream", "entries"],
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -388,6 +521,7 @@ SINK_GREP_PATTERNS = {
     "rce": r"Runtime\..*exec|ProcessBuilder|ScriptEngine\.eval|Expression\.getValue|parseExpression|Class\.forName.*invoke",
     "xxe": r"DocumentBuilder|SAXReader|XMLInputFactory|SAXParser|SAXBuilder|Unmarshaller|Transformer\.transform|DocumentHelper|XMLReader|Digester|SchemaFactory|XSSFExportToXml|XMLDecoder",
     "ssrf": r"URL\(|openConnection|HttpClient|RestTemplate|WebClient|OkHttp|openStream|HttpURLConnection",
+    "path_traversal": r"new File\(|FileInputStream\(|FileOutputStream\(|FileReader\(|FileWriter\(|RandomAccessFile\(|Paths\.get\(|Path\.of\(|Files\.(read|write|copy|move|delete|exists|newInput|newOutput|lines|walk|list)|getRealPath\(|getResource\(|ClassPathResource\(|FileSystemResource\(|ResourceLoader|staticFile|externalLocation|ZipInputStream|ZipFile",
     "mybatis_dollar": r"\$\{",
 }
 
@@ -429,6 +563,8 @@ files, it is more likely to contain a real vulnerability.
 {xxe_sinks}
 
 {ssrf_sinks}
+
+{path_traversal_sinks}
 
 ## Structured Sink Definitions (ClassName#method format)
 These are the authoritative sink definitions. A function call is a sink if \
@@ -479,7 +615,7 @@ Process each method from your work queue. For each method, perform TWO tasks:
 listed in the sink patterns above OR in the structured sink definitions? \
 Match against the ClassName#method patterns. If not, skip to Task B.
 3. If potential sinks exist, determine:
-   - What type of vulnerability? (SQLI / RCE / XXE / SSRF)
+   - What type of vulnerability? (SQLI / RCE / XXE / SSRF / Path Traversal)
    - Which specific function call is the sink?
    - What data flows into the sink? Is it user-controlled?
    - Confidence score (0-10)
@@ -509,7 +645,8 @@ analysed in the current call chain (track by file path + method signature)
 - Skip methods that only receive numeric primitives (int, long, boolean)
 - Skip standard library and framework utility methods
 - Focus on DAO/repository methods, service methods, and any method that \
-constructs SQL, executes commands, parses XML, or makes HTTP requests
+constructs SQL, executes commands, parses XML, makes HTTP requests, or \
+performs file system operations (reading, writing, serving files)
 
 ### Phase 3: Multi-Judge Verification
 
@@ -555,6 +692,13 @@ automatically parameterizes queries. If yes, return True (safe).
 3. sanitizer_check: {ssrf_sanitizer_check}
 4. taint_check: {ssrf_taint_check}
 
+**For Path Traversal vulnerabilities (CWE-22):**
+1. sink_check: {pt_sink_check}
+2. input_check: {pt_input_check}
+3. canonicalization_check: {pt_canonicalization_check}
+4. sanitizer_check: {pt_sanitizer_check}
+5. taint_check: {pt_taint_check}
+
 A finding is CONFIRMED only if ALL checks return False (unsafe). If ANY \
 check returns True (safe), the finding is a false positive — discard it.
 
@@ -592,7 +736,7 @@ submit_findings(file_path="{output_dir}/taint-findings-group-{group_id}.json")
 Each finding MUST have this structure:
 {{
   "id": "TAINT-{group_id}-001",
-  "type": "sqli" | "rce" | "xxe" | "ssrf",
+  "type": "sqli" | "rce" | "xxe" | "ssrf" | "path_traversal",
   "severity": "critical" | "high" | "medium" | "low",
   "title": "SQL Injection in UserController.search() via 'keyword' parameter",
   "file_path": "/absolute/path/to/File.java",
@@ -625,8 +769,8 @@ If you find NO vulnerabilities after thorough analysis, submit:
 {{"findings": []}}
 
 ### Severity Guidelines
-- **critical**: Direct SQL injection, RCE, or XXE with no sanitization, \
-reachable from unauthenticated endpoints
+- **critical**: Direct SQL injection, RCE, XXE, or path traversal allowing \
+arbitrary file read/write with no sanitization, reachable from unauthenticated endpoints
 - **high**: Same as critical but behind authentication, or with partial \
 mitigation that can be bypassed
 - **medium**: Indirect taint flow, requires specific conditions to exploit
@@ -653,6 +797,12 @@ re-analysing methods already visited in the current call chain
 10. Include multi_judge_results in each finding to show which checks were \
 applied and their results
 11. Confidence score must be >= 5 to enter multi-judge verification
+12. For path traversal: check for BOTH canonicalization AND bounds validation. \
+A getCanonicalPath() call alone is NOT sufficient — it must be followed by a \
+startsWith(baseDir) check. Also consider URL-encoded traversal sequences \
+(%2e%2e%2f, %252e%252e%252f) and framework-level static file serving CVEs.
+13. Check the framework version in pom.xml/build.gradle for known CVEs \
+(e.g., SparkJava 2.7.1 CVE-2018-9159, Spring Cloud Config CVE-2020-5410).
 """
 
 
@@ -715,6 +865,7 @@ def _taint_compression_summary(dropped_msgs: list[dict]) -> str:
             ("RCE", {"RCE", "REMOTE CODE EXECUTION", "COMMAND INJECTION"}),
             ("XXE", {"XXE", "XML EXTERNAL ENTITY"}),
             ("SSRF", {"SSRF", "SERVER-SIDE REQUEST FORGERY", "SERVER SIDE REQUEST FORGERY"}),
+            ("PATH_TRAVERSAL", {"PATH TRAVERSAL", "DIRECTORY TRAVERSAL", "CWE-22", "PATH_TRAVERSAL"}),
         ):
             if any(kw in tu for kw in keywords):
                 vuln_types_seen.add(vtype)
@@ -896,6 +1047,7 @@ async def _analyze_route_group(
             rce_sinks=RCE_SINKS,
             xxe_sinks=XXE_SINKS,
             ssrf_sinks=SSRF_SINKS,
+            path_traversal_sinks=PATH_TRAVERSAL_SINKS,
             sqli_sink_check=MULTI_JUDGE_CHECKS["sqli"]["sink_check"],
             sqli_xml_taint_num_check=MULTI_JUDGE_CHECKS["sqli"]["xml_taint_num_check"],
             sqli_sink_taint_fixed_check=MULTI_JUDGE_CHECKS["sqli"]["sink_taint_fixed_check"],
@@ -914,6 +1066,11 @@ async def _analyze_route_group(
             ssrf_input_check=MULTI_JUDGE_CHECKS["ssrf"]["input_check"],
             ssrf_sanitizer_check=MULTI_JUDGE_CHECKS["ssrf"]["sanitizer_check"],
             ssrf_taint_check=MULTI_JUDGE_CHECKS["ssrf"]["taint_check"],
+            pt_sink_check=MULTI_JUDGE_CHECKS["path_traversal"]["sink_check"],
+            pt_input_check=MULTI_JUDGE_CHECKS["path_traversal"]["input_check"],
+            pt_canonicalization_check=MULTI_JUDGE_CHECKS["path_traversal"]["canonicalization_check"],
+            pt_sanitizer_check=MULTI_JUDGE_CHECKS["path_traversal"]["sanitizer_check"],
+            pt_taint_check=MULTI_JUDGE_CHECKS["path_traversal"]["taint_check"],
         )
 
         agent = AuditAgent(
@@ -932,11 +1089,14 @@ async def _analyze_route_group(
             f"Perform forward-tracing taint analysis on your assigned group "
             f"of {len(routes)} routes in the project at {config.project_path}. "
             f"Start from each route handler, trace forward into sub-functions "
-            f"(up to 8 levels deep), check each method for SQLI/RCE/XXE/SSRF "
-            f"sinks, and verify each finding with the full multi-judge check "
-            f"pipeline (6 checks for Java SQLI, 4 checks for other types). "
+            f"(up to 8 levels deep), check each method for SQLI/RCE/XXE/SSRF/"
+            f"Path Traversal sinks, and verify each finding with the full "
+            f"multi-judge check pipeline (6 checks for Java SQLI, 5 checks for "
+            f"Path Traversal, 4 checks for other types). "
             f"Include multi_judge_results and confidence_score in each finding. "
             f"Report only confirmed vulnerabilities (ALL checks return False). "
+            f"Also check pom.xml/build.gradle for framework versions with known "
+            f"CVEs in static file serving or path handling. "
             f"If you find NO vulnerabilities, submit {{\"findings\": []}}."
         )
 
@@ -1028,7 +1188,7 @@ def _merge_findings(group_results: list[dict | BaseException]) -> list[dict]:
     layer=1,
     depends_on=["route_mapper"],
     timeout=3600,  # increased for multi-group parallelism
-    description="LLM-driven taint analysis for SQLI, RCE, XXE, SSRF vulnerabilities (route-group parallelism)",
+    description="LLM-driven taint analysis for SQLI, RCE, XXE, SSRF, Path Traversal vulnerabilities (route-group parallelism)",
 )
 async def run_taint_analyzer(config: AuditConfig, inputs: dict) -> dict:
     """Coordinator: split routes into groups and run parallel taint analysis.
